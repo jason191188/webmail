@@ -1,0 +1,555 @@
+<!doctype html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="theme-color" content="#2457d6">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-title" content="메일 비서">
+<title>메일 비서</title>
+<style>
+  :root {
+    --bg: #f5f6f8; --panel: #ffffff; --text: #1c2330; --muted: #6a7385; --line: #dfe3ea;
+    --accent: #2457d6; --accent-text: #ffffff; --danger: #c0392b; --ok: #1e8e5a; --soft: #eef2fb;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #14171c; --panel: #1d2128; --text: #e6e9ef; --muted: #9aa3b2; --line: #313743;
+      --accent: #6d94ff; --accent-text: #10131a; --danger: #ff7b6b; --ok: #5fd39a; --soft: #232a38;
+    }
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--text);
+         font: 15px/1.55 "Malgun Gothic", "Apple SD Gothic Neo", system-ui, sans-serif; }
+  header { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; padding: 12px 16px;
+           background: var(--panel); border-bottom: 1px solid var(--line); }
+  header h1 { font-size: 17px; margin: 0; margin-right: auto; }
+  main { max-width: 1100px; margin: 0 auto; padding: 16px; }
+  .panel { background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 16px; margin-bottom: 16px; }
+  h2 { font-size: 16px; margin: 0 0 12px; }
+  h3 { font-size: 14px; margin: 16px 0 6px; color: var(--muted); }
+  button { font: inherit; padding: 7px 14px; border-radius: 7px; border: 1px solid var(--line);
+           background: var(--panel); color: var(--text); cursor: pointer; }
+  button.primary { background: var(--accent); border-color: var(--accent); color: var(--accent-text); }
+  button.danger { color: var(--danger); }
+  button:disabled { opacity: .55; cursor: default; }
+  input, select, textarea { font: inherit; width: 100%; padding: 8px 10px; border-radius: 7px;
+           border: 1px solid var(--line); background: var(--bg); color: var(--text); }
+  textarea { min-height: 240px; resize: vertical; }
+  label { display: block; margin: 10px 0 4px; font-size: 13px; color: var(--muted); }
+  .row { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+  .tabs { display: flex; gap: 6px; margin-bottom: 16px; flex-wrap: wrap; }
+  .tabs button.active { background: var(--soft); border-color: var(--accent); color: var(--accent); font-weight: 600; }
+  .muted { color: var(--muted); font-size: 13px; }
+  .msg { padding: 9px 12px; border-radius: 7px; margin: 10px 0; font-size: 14px; }
+  .msg.err { background: color-mix(in srgb, var(--danger) 14%, transparent); color: var(--danger); }
+  .msg.ok { background: color-mix(in srgb, var(--ok) 14%, transparent); color: var(--ok); }
+  .login { max-width: 380px; margin: 9vh auto 0; }
+  .mail-layout { display: grid; grid-template-columns: minmax(280px, 380px) 1fr; gap: 16px; align-items: start; }
+  @media (max-width: 800px) { .mail-layout { grid-template-columns: 1fr; } }
+  .mail-list { list-style: none; margin: 0; padding: 0; }
+  .mail-list li { padding: 10px 12px; border-bottom: 1px solid var(--line); border-radius: 7px; }
+  .mail-list li.clickable { cursor: pointer; }
+  .mail-list li.selected { background: var(--soft); }
+  .mail-list .subject { font-weight: 600; overflow-wrap: anywhere; }
+  .badge { display: inline-block; font-size: 11px; padding: 1px 7px; border-radius: 10px;
+           background: var(--soft); color: var(--accent); margin-left: 6px; vertical-align: 1px; }
+  pre.body { white-space: pre-wrap; overflow-wrap: anywhere; font: inherit; margin: 0; padding: 12px;
+             background: var(--bg); border-radius: 7px; max-height: 420px; overflow: auto; }
+  table { width: 100%; border-collapse: collapse; }
+  th, td { text-align: left; padding: 8px 6px; border-bottom: 1px solid var(--line); font-size: 14px; }
+  .table-wrap { overflow-x: auto; }
+  ul.actions { margin: 0; padding-left: 20px; }
+  .hidden { display: none; }
+</style>
+</head>
+<body>
+<div id="app"></div>
+<script>
+"use strict";
+// 프록시 프리픽스(/webmail 등) 아래에서도 동작하도록 현재 경로 기준으로 API 주소를 만든다
+const BASE = location.pathname.endsWith("/") ? location.pathname : location.pathname + "/";
+const TOKEN_KEY = "webmail_token";
+const state = { token: null, user: null, tab: "mails", mails: [], selected: null, timer: null, onNewMail: null };
+try { state.token = localStorage.getItem(TOKEN_KEY); } catch (e) {}
+
+// 홈 화면 설치(웹앱)용 링크. 프리픽스 아래에서도 맞는 주소가 되도록 스크립트로 넣는다.
+for (const [rel, file] of [["manifest", "manifest.webmanifest"], ["icon", "icon-192.png"], ["apple-touch-icon", "icon-192.png"]]) {
+  const link = document.createElement("link");
+  link.rel = rel; link.href = BASE + file;
+  document.head.append(link);
+}
+
+// 메일 제목/본문은 외부인이 쓴 글이므로 항상 텍스트로만 넣는다 (innerHTML 사용 금지)
+function h(tag, attrs, ...children) {
+  const el = document.createElement(tag);
+  for (const [k, v] of Object.entries(attrs || {})) {
+    if (v === null || v === undefined || v === false) continue;
+    if (k === "class") el.className = v;
+    else if (k.startsWith("on")) el.addEventListener(k.slice(2), v);
+    else if (k === "value") el.value = v;
+    else el.setAttribute(k, v === true ? "" : v);
+  }
+  for (const c of children.flat()) {
+    if (c === null || c === undefined || c === false) continue;
+    el.append(c instanceof Node ? c : document.createTextNode(String(c)));
+  }
+  return el;
+}
+
+async function api(method, path, body, params) {
+  let url = BASE + path;
+  if (params) url += "?" + new URLSearchParams(params);
+  const headers = {};
+  if (state.token) headers["Authorization"] = "Bearer " + state.token;
+  if (body !== undefined) headers["Content-Type"] = "application/json";
+  let res;
+  try {
+    res = await fetch(url, { method, headers, body: body === undefined ? undefined : JSON.stringify(body) });
+  } catch (e) {
+    throw new Error("서버에 연결하지 못했습니다.");
+  }
+  if (res.status === 401 && path !== "auth/login") { setToken(null); state.user = null; render(); }
+  if (res.status === 204) return null;
+  let data = null;
+  try { data = await res.json(); } catch (e) {}
+  if (!res.ok) {
+    let detail = data && data.detail;
+    if (Array.isArray(detail)) detail = detail.map(d => (d.loc || []).slice(1).join(".") + ": " + d.msg).join(" / ");
+    const err = new Error(detail || ("요청 실패 (" + res.status + ")"));
+    err.status = res.status;
+    throw err;
+  }
+  return data;
+}
+
+function setToken(token) {
+  state.token = token;
+  try { token ? localStorage.setItem(TOKEN_KEY, token) : localStorage.removeItem(TOKEN_KEY); } catch (e) {}
+}
+
+function fmtTime(iso) {
+  const d = new Date(iso);
+  return isNaN(d) ? (iso || "") : d.toLocaleString("ko-KR", { dateStyle: "short", timeStyle: "short" });
+}
+
+function msgBox() {
+  const box = h("div", { class: "msg hidden" });
+  box.show = (text, ok) => { box.textContent = text; box.className = "msg " + (ok ? "ok" : "err"); };
+  box.clear = () => { box.className = "msg hidden"; };
+  return box;
+}
+
+// 버튼을 누른 동안 비활성화하고, 실패하면 메시지 상자에 이유를 보여준다
+async function run(btn, box, fn) {
+  if (box) box.clear();
+  if (btn) btn.disabled = true;
+  try { await fn(); }
+  catch (e) { if (box) box.show(e.message, false); }
+  finally { if (btn) btn.disabled = false; }
+}
+
+const isAdmin = () => state.user && state.user.role === "admin";
+
+// ---------- 로그인 ----------
+function loginView() {
+  const box = msgBox();
+  const username = h("input", { autocomplete: "username", required: true });
+  const password = h("input", { type: "password", autocomplete: "current-password", required: true });
+  const btn = h("button", { class: "primary", type: "submit" }, "로그인");
+  const form = h("form", { class: "panel login", onsubmit: (ev) => {
+    ev.preventDefault();
+    run(btn, box, async () => {
+      const data = await api("POST", "auth/login", { username: username.value, password: password.value });
+      setToken(data.access_token);
+      state.user = data.user;
+      state.tab = "mails";
+      render();
+    });
+  } },
+    h("h2", {}, "메일 비서 로그인"),
+    h("label", {}, "아이디"), username,
+    h("label", {}, "비밀번호"), password,
+    box,
+    h("div", { class: "row", style: "margin-top:14px" }, btn),
+    h("p", { class: "muted" }, "계정은 관리자가 만들어 줍니다."));
+  return form;
+}
+
+// ---------- 푸시 알림 ----------
+const pushSupported = () => "serviceWorker" in navigator && "PushManager" in window && "Notification" in window;
+const isIOS = () => /iPad|iPhone|iPod/.test(navigator.userAgent) || (navigator.platform === "MacIntel" && navigator.maxTouchPoints > 1);
+const isStandalone = () => window.matchMedia("(display-mode: standalone)").matches || navigator.standalone === true;
+
+function b64urlToBytes(text) {
+  const b64 = text.replace(/-/g, "+").replace(/_/g, "/") + "=".repeat((4 - text.length % 4) % 4);
+  return Uint8Array.from(atob(b64), c => c.charCodeAt(0));
+}
+function bytesToB64url(buffer) {
+  return btoa(String.fromCharCode(...new Uint8Array(buffer))).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+}
+
+async function swRegistration() {
+  await navigator.serviceWorker.register(BASE + "sw.js", { scope: BASE });
+  return navigator.serviceWorker.ready;
+}
+
+// 로그아웃할 때 이 기기의 알림 등록을 지운다 (다음 사용자에게 이전 사용자의 알림이 가지 않게)
+async function dropPushSubscription() {
+  try {
+    if (!pushSupported()) return;
+    const reg = await navigator.serviceWorker.getRegistration(BASE);
+    const sub = reg && await reg.pushManager.getSubscription();
+    if (!sub) return;
+    await api("POST", "push/unsubscribe", { endpoint: sub.endpoint });
+    await sub.unsubscribe();
+  } catch (e) {}
+}
+
+function pushControl(box) {
+  const host = h("span", { class: "row" });
+  const note = (text) => host.replaceChildren(h("span", { class: "muted" }, text));
+
+  async function draw() {
+    if (!window.isSecureContext) return note("휴대폰 알림은 HTTPS 주소로 접속해야 켤 수 있습니다.");
+    if (!pushSupported()) {
+      return note(isIOS() && !isStandalone()
+        ? "아이폰은 Safari 공유 버튼 → '홈 화면에 추가'로 설치한 뒤, 홈 화면 아이콘으로 열어야 알림을 켤 수 있습니다."
+        : "이 브라우저는 푸시 알림을 지원하지 않습니다.");
+    }
+    let key;
+    try { key = (await api("GET", "push/public-key")).public_key; }
+    catch (e) { return note(e.status === 503 ? "서버에 푸시 알림 설정이 아직 없습니다." : e.message); }
+
+    const reg = await swRegistration();
+    let sub = await reg.pushManager.getSubscription();
+    // 서버 키가 바뀌었으면 예전 등록은 쓸 수 없으므로 지운다
+    if (sub && sub.options.applicationServerKey && bytesToB64url(sub.options.applicationServerKey) !== key) {
+      await sub.unsubscribe();
+      sub = null;
+    }
+    const register = (s) => api("POST", "push/subscriptions", s.toJSON());
+
+    if (sub) {
+      await register(sub);
+      const testBtn = h("button", { onclick: () => run(testBtn, box, async () => {
+        const r = await api("POST", "push/test");
+        box.show("테스트 알림을 보냈습니다. (성공 " + r.sent + ", 실패 " + r.failed + ")", r.failed === 0);
+      }) }, "테스트 알림");
+      const offBtn = h("button", { onclick: () => run(offBtn, box, async () => { await dropPushSubscription(); await draw(); }) }, "이 기기 알림 끄기");
+      host.replaceChildren(h("span", { class: "badge" }, "이 기기 알림 켜짐"), testBtn, offBtn);
+    } else if (Notification.permission === "denied") {
+      note("이 기기에서 알림이 차단돼 있습니다. 브라우저(또는 휴대폰) 설정에서 이 사이트의 알림을 허용한 뒤 새로 고치세요.");
+    } else {
+      const onBtn = h("button", { class: "primary", onclick: () => run(onBtn, box, async () => {
+        const permission = await Notification.requestPermission();    // 누른 직후에 바로 물어야 한다
+        if (permission !== "granted") { await draw(); return; }
+        const created = await reg.pushManager.subscribe({ userVisibleOnly: true, applicationServerKey: b64urlToBytes(key) });
+        await register(created);
+        await draw();
+      }) }, "이 기기에서 알림 받기");
+      host.replaceChildren(onBtn);
+    }
+  }
+  draw().catch(e => note("알림 설정을 확인하지 못했습니다: " + e.message));
+  return host;
+}
+
+if ("serviceWorker" in navigator) {
+  navigator.serviceWorker.addEventListener("message", (ev) => {
+    if (ev.data && ev.data.type === "new-mail" && state.onNewMail) state.onNewMail();
+  });
+}
+
+// ---------- 메일 ----------
+async function loadMails() {
+  state.mails = await api("GET", "mails", undefined, { limit: 100 });
+}
+
+function mailsView() {
+  const box = msgBox();
+  const listHost = h("div", {});
+  const detailHost = h("div", {});
+
+  function drawList() {
+    listHost.replaceChildren(state.mails.length
+      ? h("ul", { class: "mail-list" }, state.mails.map(m =>
+          h("li", { class: (isAdmin() ? "clickable " : "") + (state.selected === m.id ? "selected" : ""),
+                    onclick: isAdmin() ? () => { state.selected = m.id; drawList(); drawDetail(); } : null },
+            h("div", { class: "subject" }, m.subject,
+              m.has_attachments ? h("span", { class: "badge" }, "첨부") : null,
+              m.analyzed ? h("span", { class: "badge" }, "분석됨") : null),
+            h("div", { class: "muted" }, m.sender),
+            h("div", { class: "muted" }, "수신 확인 " + fmtTime(m.fetched_at)))))
+      : h("p", { class: "muted" }, "아직 도착한 새 메일이 없습니다. 메일 계정을 등록한 뒤에 도착한 메일부터 표시됩니다."));
+  }
+
+  async function drawDetail() {
+    if (!isAdmin()) { detailHost.replaceChildren(); return; }
+    if (!state.selected) {
+      detailHost.replaceChildren(h("div", { class: "panel" }, h("p", { class: "muted" }, "왼쪽에서 메일을 선택하세요.")));
+      return;
+    }
+    const id = state.selected;
+    const dbox = msgBox();
+    const analysisHost = h("div", {});
+    detailHost.replaceChildren(h("div", { class: "panel" }, h("p", { class: "muted" }, "불러오는 중...")));
+    let mail, analysis = null;
+    try {
+      mail = await api("GET", "mails/" + id);
+      try { analysis = await api("GET", "mails/" + id + "/analysis"); }
+      catch (e) { if (e.status !== 404) throw e; }
+    } catch (e) {
+      detailHost.replaceChildren(h("div", { class: "panel" }, h("div", { class: "msg err" }, e.message)));
+      return;
+    }
+    if (state.selected !== id) return;
+
+    function drawAnalysis() {
+      if (!analysis) {
+        const btn = h("button", { class: "primary", onclick: () => request(btn, false) }, "요약·답장 초안 요청");
+        analysisHost.replaceChildren(
+          h("p", { class: "muted" }, "요청하면 Claude API를 호출하며 비용이 발생합니다."), btn);
+        return;
+      }
+      const draft = h("textarea", { value: analysis.reply_draft });
+      const copyBtn = h("button", { onclick: async () => {
+        try { await navigator.clipboard.writeText(draft.value); dbox.show("초안을 복사했습니다.", true); }
+        catch (e) { draft.select(); dbox.show("복사하지 못했습니다. 선택된 내용을 직접 복사하세요.", false); }
+      } }, "초안 복사");
+      const againBtn = h("button", { onclick: () => {
+        if (confirm("다시 분석하면 Claude API 비용이 한 번 더 발생합니다. 진행할까요?")) request(againBtn, true);
+      } }, "다시 분석");
+      analysisHost.replaceChildren(
+        h("h3", {}, "요약"), h("pre", { class: "body" }, analysis.summary),
+        h("h3", {}, "필요한 조치"),
+        analysis.actions.length ? h("ul", { class: "actions" }, analysis.actions.map(a => h("li", {}, a)))
+                                : h("p", { class: "muted" }, "없음"),
+        h("h3", {}, "답장 초안"),
+        analysis.reply_needed ? draft : h("p", { class: "muted" }, "답장이 필요 없는 메일로 판단했습니다."),
+        h("div", { class: "row", style: "margin-top:10px" }, analysis.reply_needed ? copyBtn : null, againBtn),
+        h("p", { class: "muted" }, analysis.model + " · 입력 " + analysis.input_tokens + " / 출력 "
+          + analysis.output_tokens + " 토큰 · " + fmtTime(analysis.created_at)));
+    }
+
+    function request(btn, force) {
+      run(btn, dbox, async () => {
+        btn.textContent = "분석 중...";
+        try {
+          analysis = await api("POST", "mails/" + id + "/analysis", undefined, force ? { force: "true" } : undefined);
+        } finally { btn.textContent = force ? "다시 분석" : "요약·답장 초안 요청"; }
+        const row = state.mails.find(m => m.id === id);
+        if (row) row.analyzed = true;
+        drawList();
+        if (state.selected === id) drawAnalysis();
+      });
+    }
+
+    detailHost.replaceChildren(h("div", { class: "panel" },
+      h("h2", {}, mail.subject),
+      h("div", { class: "muted" }, "보낸사람: " + mail.sender),
+      h("div", { class: "muted" }, "받는사람: " + mail.recipient),
+      h("div", { class: "muted" }, "날짜: " + mail.mail_date),
+      mail.attachments.length ? h("div", { class: "muted" }, "첨부: " + mail.attachments.join(", ")) : null,
+      h("h3", {}, "본문"), h("pre", { class: "body" }, mail.body || "(본문 없음)"),
+      mail.truncated ? h("p", { class: "muted" }, "본문이 길어 앞부분만 저장했습니다.") : null,
+      h("h3", {}, "요약·답장 초안"), dbox, analysisHost));
+    drawAnalysis();
+  }
+
+  async function refresh() {
+    await loadMails();
+    drawList();
+  }
+
+  const syncBtn = h("button", { onclick: () => run(syncBtn, box, async () => {
+    const r = await api("POST", "mails/sync");
+    await refresh();
+    box.show(r.new_mails ? "새 메일 " + r.new_mails + "건을 가져왔습니다." : "새 메일이 없습니다.", true);
+  }) }, "지금 확인");
+
+  run(null, box, refresh).then(drawDetail);
+  clearInterval(state.timer);
+  state.timer = setInterval(() => { if (state.tab === "mails" && state.user) refresh().catch(() => {}); }, 60000);
+  state.onNewMail = () => { if (state.tab === "mails" && state.user) refresh().catch(() => {}); };
+
+  return h("div", {},
+    h("div", { class: "row", style: "margin-bottom:12px" }, syncBtn, pushControl(box)),
+    h("p", { class: "muted" }, "서버가 주기적으로 메일함을 확인하고, 이 화면은 1분마다 새로 고칩니다."),
+    box,
+    h("div", { class: isAdmin() ? "mail-layout" : "" },
+      h("div", { class: "panel" }, h("h2", {}, "새 메일"), listHost),
+      detailHost));
+}
+
+// ---------- 메일 계정 ----------
+function accountView() {
+  const box = msgBox();
+  const statusHost = h("div", {});
+  const mailUser = h("input", { placeholder: "name@hprobot.ai", autocomplete: "off", required: true });
+  const mailPass = h("input", { type: "password", autocomplete: "new-password", required: true });
+  const popHost = h("input", { value: "webmail.hprobot.ai", required: true });
+  const popPort = h("input", { type: "number", value: "110", min: "1", max: "65535", required: true });
+  const tlsName = h("input", { value: "pop3.cafe24.com" });
+
+  async function drawStatus() {
+    try {
+      const a = await api("GET", "me/mail-account");
+      mailUser.value = a.mail_user; popHost.value = a.pop_host; popPort.value = a.pop_port; tlsName.value = a.tls_name;
+      const delBtn = h("button", { class: "danger", onclick: () => {
+        if (!confirm("메일 계정 등록을 해제할까요? 새 메일 확인이 멈춥니다.")) return;
+        run(delBtn, box, async () => { await api("DELETE", "me/mail-account"); box.show("등록을 해제했습니다.", true); drawStatus(); });
+      } }, "등록 해제");
+      statusHost.replaceChildren(
+        h("p", {}, "등록된 계정: ", h("strong", {}, a.mail_user)),
+        h("p", { class: "muted" }, "마지막 확인: " + (a.last_checked_at ? fmtTime(a.last_checked_at) : "아직 없음")),
+        a.last_error ? h("div", { class: "msg err" }, "마지막 확인 실패: " + a.last_error) : null,
+        delBtn);
+    } catch (e) {
+      statusHost.replaceChildren(e.status === 404
+        ? h("p", { class: "muted" }, "등록된 메일 계정이 없습니다. 아래에서 등록하세요.")
+        : h("div", { class: "msg err" }, e.message));
+    }
+  }
+  drawStatus();
+
+  const btn = h("button", { class: "primary", type: "submit" }, "로그인 확인 후 저장");
+  return h("div", {},
+    h("div", { class: "panel" }, h("h2", {}, "메일 계정"), statusHost),
+    h("form", { class: "panel", onsubmit: (ev) => {
+      ev.preventDefault();
+      run(btn, box, async () => {
+        const r = await api("PUT", "me/mail-account", {
+          mail_user: mailUser.value.trim(), mail_password: mailPass.value,
+          pop_host: popHost.value.trim(), pop_port: Number(popPort.value), tls_name: tlsName.value.trim() });
+        mailPass.value = "";
+        box.show("저장했습니다. 기존 메일 " + r.skipped_existing_mails + "통은 건너뛰고, 이후 도착하는 메일부터 표시합니다.", true);
+        drawStatus();
+      });
+    } },
+      h("h2", {}, "계정 등록 / 변경"),
+      h("label", {}, "메일 주소"), mailUser,
+      h("label", {}, "메일 비밀번호 (암호화해서 저장합니다)"), mailPass,
+      h("details", { style: "margin-top:12px" },
+        h("summary", { class: "muted" }, "서버 설정 (보통 그대로 둡니다)"),
+        h("label", {}, "POP3 서버"), popHost,
+        h("label", {}, "POP3 포트"), popPort,
+        h("label", {}, "인증서 대조 이름"), tlsName),
+      box,
+      h("div", { class: "row", style: "margin-top:14px" }, btn)));
+}
+
+// ---------- 내 비밀번호 ----------
+function passwordView() {
+  const box = msgBox();
+  const cur = h("input", { type: "password", autocomplete: "current-password", required: true });
+  const next = h("input", { type: "password", autocomplete: "new-password", minlength: "8", required: true });
+  const again = h("input", { type: "password", autocomplete: "new-password", minlength: "8", required: true });
+  const btn = h("button", { class: "primary", type: "submit" }, "비밀번호 변경");
+  return h("form", { class: "panel", style: "max-width:420px", onsubmit: (ev) => {
+    ev.preventDefault();
+    if (next.value !== again.value) { box.show("새 비밀번호가 서로 다릅니다.", false); return; }
+    run(btn, box, async () => {
+      await api("PUT", "me/password", { current_password: cur.value, new_password: next.value });
+      cur.value = next.value = again.value = "";
+      box.show("변경했습니다. 다른 기기는 로그아웃됩니다.", true);
+    });
+  } },
+    h("h2", {}, "비밀번호 변경"),
+    h("label", {}, "현재 비밀번호"), cur,
+    h("label", {}, "새 비밀번호 (8자 이상)"), next,
+    h("label", {}, "새 비밀번호 확인"), again,
+    box, h("div", { class: "row", style: "margin-top:14px" }, btn));
+}
+
+// ---------- 사용자 관리 (관리자) ----------
+function usersView() {
+  const box = msgBox();
+  const tableHost = h("div", { class: "table-wrap" });
+
+  async function draw() {
+    const users = await api("GET", "admin/users");
+    tableHost.replaceChildren(h("table", {},
+      h("thead", {}, h("tr", {}, ["아이디", "역할", "상태", "만든 날", "관리"].map(t => h("th", {}, t)))),
+      h("tbody", {}, users.map(u => {
+        const patch = (btn, body, okText) => run(btn, box, async () => {
+          await api("PATCH", "admin/users/" + u.id, body); box.show(okText, true); await draw();
+        });
+        const roleBtn = h("button", { onclick: () => patch(roleBtn, { role: u.role === "admin" ? "user" : "admin" }, "역할을 바꿨습니다.") },
+          u.role === "admin" ? "일반으로" : "관리자로");
+        const activeBtn = h("button", { class: u.is_active ? "danger" : "", onclick: () => {
+          if (u.is_active && !confirm(u.username + " 계정을 비활성화할까요? 즉시 로그아웃됩니다.")) return;
+          patch(activeBtn, { is_active: !u.is_active }, u.is_active ? "비활성화했습니다." : "다시 활성화했습니다.");
+        } }, u.is_active ? "비활성화" : "활성화");
+        const pwBtn = h("button", { onclick: () => {
+          const pw = prompt(u.username + " 의 새 비밀번호 (8자 이상)");
+          if (pw) patch(pwBtn, { password: pw }, "비밀번호를 초기화했습니다.");
+        } }, "비밀번호 초기화");
+        return h("tr", {},
+          h("td", {}, u.username, u.id === state.user.id ? h("span", { class: "badge" }, "나") : null),
+          h("td", {}, u.role === "admin" ? "관리자" : "일반"),
+          h("td", {}, u.is_active ? "사용 중" : "비활성"),
+          h("td", {}, fmtTime(u.created_at)),
+          h("td", {}, h("div", { class: "row" }, roleBtn, activeBtn, pwBtn)));
+      }))));
+  }
+  run(null, box, draw);
+
+  const username = h("input", { autocomplete: "off", minlength: "3", required: true });
+  const password = h("input", { type: "password", autocomplete: "new-password", minlength: "8", required: true });
+  const role = h("select", {}, h("option", { value: "user" }, "일반 (알림만)"), h("option", { value: "admin" }, "관리자 (요약·초안 가능)"));
+  const btn = h("button", { class: "primary", type: "submit" }, "계정 만들기");
+  return h("div", {},
+    h("div", { class: "panel" }, h("h2", {}, "사용자"), box, tableHost),
+    h("form", { class: "panel", style: "max-width:420px", onsubmit: (ev) => {
+      ev.preventDefault();
+      run(btn, box, async () => {
+        await api("POST", "admin/users", { username: username.value.trim(), password: password.value, role: role.value });
+        box.show(username.value.trim() + " 계정을 만들었습니다.", true);
+        username.value = password.value = "";
+        await draw();
+      });
+    } },
+      h("h2", {}, "계정 추가"),
+      h("label", {}, "아이디 (영문, 숫자, . _ @ -)"), username,
+      h("label", {}, "임시 비밀번호 (8자 이상)"), password,
+      h("label", {}, "역할"), role,
+      h("div", { class: "row", style: "margin-top:14px" }, btn)));
+}
+
+// ---------- 전체 화면 ----------
+function render() {
+  const app = document.getElementById("app");
+  clearInterval(state.timer);
+  if (!state.user) { app.replaceChildren(loginView()); return; }
+
+  const tabs = [["mails", "메일"], ["account", "메일 계정"], ["password", "비밀번호"]];
+  if (isAdmin()) tabs.push(["users", "사용자 관리"]);
+  const views = { mails: mailsView, account: accountView, password: passwordView, users: usersView };
+  if (!views[state.tab] || (state.tab === "users" && !isAdmin())) state.tab = "mails";
+
+  app.replaceChildren(
+    h("header", {},
+      h("h1", {}, "메일 비서"),
+      h("span", { class: "muted" }, state.user.username + " · " + (isAdmin() ? "관리자" : "일반")),
+      h("button", { onclick: async () => {
+        await dropPushSubscription();
+        try { await api("POST", "auth/logout"); } catch (e) {}
+        setToken(null); state.user = null; state.selected = null; state.mails = []; state.onNewMail = null; render();
+      } }, "로그아웃")),
+    h("main", {},
+      h("div", { class: "tabs" }, tabs.map(([key, label]) =>
+        h("button", { class: state.tab === key ? "active" : "", onclick: () => { state.tab = key; render(); } }, label))),
+      views[state.tab]()));
+}
+
+(async function start() {
+  if (state.token) {
+    try { state.user = await api("GET", "me"); } catch (e) { state.user = null; }
+  }
+  render();
+})();
+</script>
+</body>
+</html>

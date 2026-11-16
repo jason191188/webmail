@@ -1,0 +1,7 @@
+fastapi==0.163.1
+uvicorn[standard]==0.54.0
+pydantic==2.14.3
+argon2-cffi==25.1.0
+cryptography==50.0.2
+anthropic==2.8.0
+pywebpush==2.5.0
