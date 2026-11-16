@@ -21,8 +21,9 @@ def sync_account(account_id: int) -> int:
                 return 0
             known = {r["uid"] for r in conn.execute(
                 "SELECT uid FROM pop_uids WHERE account_id = ?", (account_id,))}
+            rules = push.load_rules(conn, acc["user_id"])
         try:
-            saved = _fetch_new(acc, known)
+            saved = _fetch_new(acc, known, rules)
         except Exception as e:
             with db.connect() as conn:
                 conn.execute(
@@ -36,25 +37,30 @@ def sync_account(account_id: int) -> int:
         return saved
 
 
-def _fetch_new(acc, known: set[str]) -> int:
+def _fetch_new(acc, known: set[str], rules: dict) -> int:
     pop = mailfetch.connect(acc["pop_host"], acc["pop_port"], acc["tls_name"],
                             acc["mail_user"], security.decrypt(acc["mail_password_enc"]))
-    saved = []
+    saved, to_notify = 0, []
     try:
         uids = mailfetch.list_uids(pop)
         new = sorted((num, uid) for uid, num in uids.items() if uid not in known)
         for num, uid in new[:MAX_PER_SYNC]:
             mail = mailfetch.parse_mail(mailfetch.fetch_raw(pop, num))
+            notify = push.should_notify(mail, rules)
             with db.connect() as conn:
                 cur = conn.execute(
-                    "INSERT INTO mails (user_id, uid, sender, recipient, subject, mail_date,"
-                    " attachments, body, truncated, fetched_at) VALUES (?,?,?,?,?,?,?,?,?,?)",
+                    "INSERT INTO mails (user_id, uid, sender, recipient, subject, mail_date, attachments,"
+                    " body, truncated, fetched_at, message_id, reply_to, is_bulk, notified)"
+                    " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                     (acc["user_id"], uid, mail["sender"], mail["recipient"], mail["subject"],
                      mail["mail_date"], json.dumps(mail["attachments"], ensure_ascii=False),
-                     mail["body"], int(mail["truncated"]), db.now()))
+                     mail["body"], int(mail["truncated"]), db.now(), mail["message_id"],
+                     mail["reply_to"], int(mail["is_bulk"]), int(notify)))
                 conn.execute("INSERT OR IGNORE INTO pop_uids (account_id, uid) VALUES (?, ?)",
                              (acc["id"], uid))
-            saved.append({"id": cur.lastrowid, "subject": mail["subject"], "sender": mail["sender"]})
+            saved += 1
+            if notify:
+                to_notify.append({"id": cur.lastrowid, "subject": mail["subject"], "sender": mail["sender"]})
         # 서버에서 지워진 메일의 uid 기록은 정리한다
         gone = known - set(uids)
         if gone:
@@ -66,8 +72,8 @@ def _fetch_new(acc, known: set[str]) -> int:
             pop.quit()
         except Exception:
             pass
-        push.notify_new_mails(acc["user_id"], saved)     # 중간에 실패해도 저장된 메일은 알린다
-    return len(saved)
+        push.notify_new_mails(acc["user_id"], to_notify)     # 중간에 실패해도 저장된 메일은 알린다
+    return saved
 
 
 def sync_all() -> None:

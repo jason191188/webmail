@@ -268,9 +268,57 @@ def test_poller_saves_and_notifies(client, staff, monkeypatch):
     assert len(notified) == 1
 
 
-def test_last_admin_guard_and_deactivation(client, admin, staff):
+def test_user_management_is_owner_only(client, admin, monkeypatch):
+    assert client.get("/me", headers=admin).json()["is_owner"] is True
+    r = client.post("/admin/users", headers=admin,
+                    json={"username": "manager2", "password": "manager-password-2", "role": "admin"})
+    assert r.status_code == 201 and r.json()["role"] == "admin" and r.json()["is_owner"] is False
+    second = login(client, "manager2", "manager-password-2")
+
+    # 나중에 만든 관리자는 사용자 관리를 할 수 없다
+    assert client.get("/admin/users", headers=second).status_code == 403
+    assert client.post("/admin/users", headers=second,
+                       json={"username": "sneaky", "password": "password-123"}).status_code == 403
+    assert client.patch(f"/admin/users/{r.json()['id']}", headers=second, json={"role": "user"}).status_code == 403
+    owner_id = client.get("/me", headers=admin).json()["id"]
+    assert client.patch(f"/admin/users/{owner_id}", headers=second, json={"password": "hacked-pass-1"}).status_code == 403
+
+    # 하지만 관리자 기능(요약/초안)은 그대로 쓸 수 있다
+    monkeypatch.setattr(analyzer, "analyze", lambda mail: {
+        "summary": "s", "actions": [], "reply_needed": False, "reply_draft": "",
+        "model": "test-model", "input_tokens": 1, "output_tokens": 1})
+    assert client.post(f"/mails/{add_mail('manager2')}/analysis", headers=second).status_code == 200
+
+
+def test_owner_migration_for_old_database(tmp_path):
+    """is_owner 열이 없던 이전 버전 DB 는 가장 먼저 만든 관리자가 최초 관리자가 된다."""
+    import dataclasses
+    import sqlite3
+
+    old = sqlite3.connect(tmp_path / "app.db")
+    old.execute("CREATE TABLE users (id INTEGER PRIMARY KEY AUTOINCREMENT, username TEXT NOT NULL UNIQUE COLLATE NOCASE,"
+                " password_hash TEXT NOT NULL, role TEXT NOT NULL, is_active INTEGER NOT NULL DEFAULT 1, created_at TEXT NOT NULL)")
+    old.executemany("INSERT INTO users (username, password_hash, role, created_at) VALUES (?, 'x', ?, 't')",
+                    [("first", "admin"), ("worker", "user"), ("later", "admin")])
+    old.commit()
+    old.close()
+
+    original = db.settings
+    db.settings = dataclasses.replace(original, data_dir=tmp_path)
+    try:
+        db.init()
+        db.init()                                                   # 여러 번 실행해도 결과가 같다
+        with db.connect() as conn:
+            owners = [r["username"] for r in conn.execute("SELECT username FROM users WHERE is_owner = 1")]
+    finally:
+        db.settings = original
+    assert owners == ["first"]
+
+
+def test_owner_guard_and_deactivation(client, admin, staff):
     me = client.get("/me", headers=admin).json()
     assert client.patch(f"/admin/users/{me['id']}", headers=admin, json={"role": "user"}).status_code == 400
+    assert client.patch(f"/admin/users/{me['id']}", headers=admin, json={"is_active": False}).status_code == 400
     staff_id = client.get("/me", headers=staff).json()["id"]
     assert client.patch(f"/admin/users/{staff_id}", headers=admin, json={"is_active": False}).status_code == 200
     assert client.get("/me", headers=staff).status_code == 401

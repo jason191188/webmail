@@ -2,7 +2,8 @@
 
 권한:
 - 일반 사용자(user): 자기 메일 계정 등록, 새 메일 알림(보낸사람/제목/시간) 조회
-- 관리자(admin): 위 기능 + 사용자 관리 + 자기 메일의 본문 조회, 요약/답장 초안 요청
+- 관리자(admin): 위 기능 + 자기 메일의 본문 조회, 요약/답장 초안 요청
+- 최초 관리자(is_owner): 위 기능 + 사용자 관리 (.env 로 만들어진 계정 하나뿐)
 요약/답장 초안은 POST /mails/{id}/analysis 요청이 있을 때만 Claude API 를 호출한다.
 """
 import json
@@ -36,7 +37,8 @@ def bootstrap_admin() -> None:
         if not settings.admin_username or len(settings.admin_password) < 8:
             raise SystemExit("첫 실행에는 ADMIN_USERNAME 과 8자 이상의 ADMIN_PASSWORD 가 필요합니다.")
         conn.execute(
-            "INSERT INTO users (username, password_hash, role, created_at) VALUES (?, ?, 'admin', ?)",
+            "INSERT INTO users (username, password_hash, role, created_at, is_owner)"
+            " VALUES (?, ?, 'admin', ?, 1)",
             (settings.admin_username, security.hash_password(settings.admin_password), db.now()))
         log.info("관리자 계정 '%s' 을 만들었습니다.", settings.admin_username)
 
@@ -80,8 +82,16 @@ def admin_user(user=Depends(current_user)):
     return user
 
 
+def owner_user(user=Depends(current_user)):
+    """사용자 관리는 최초 관리자(.env 로 만들어진 계정)만 할 수 있다."""
+    if not user["is_owner"]:
+        raise HTTPException(403, "최초 관리자만 사용할 수 있습니다.")
+    return user
+
+
 def user_out(row) -> dict:
     return {"id": row["id"], "username": row["username"], "role": row["role"],
+            "is_owner": bool(row["is_owner"]),
             "is_active": bool(row["is_active"]), "created_at": row["created_at"]}
 
 
@@ -186,13 +196,13 @@ class UserPatch(BaseModel):
 
 
 @app.get("/admin/users")
-def list_users(_=Depends(admin_user)):
+def list_users(_=Depends(owner_user)):
     with db.connect() as conn:
         return [user_out(r) for r in conn.execute("SELECT * FROM users ORDER BY id")]
 
 
 @app.post("/admin/users", status_code=201)
-def create_user(body: UserCreate, _=Depends(admin_user)):
+def create_user(body: UserCreate, _=Depends(owner_user)):
     with db.connect() as conn:
         if conn.execute("SELECT 1 FROM users WHERE username = ?", (body.username,)).fetchone():
             raise HTTPException(409, "이미 있는 아이디입니다.")
@@ -203,20 +213,15 @@ def create_user(body: UserCreate, _=Depends(admin_user)):
 
 
 @app.patch("/admin/users/{user_id}")
-def patch_user(user_id: int, body: UserPatch, _=Depends(admin_user)):
+def patch_user(user_id: int, body: UserPatch, _=Depends(owner_user)):
     with db.connect() as conn:
         row = conn.execute("SELECT * FROM users WHERE id = ?", (user_id,)).fetchone()
         if row is None:
             raise HTTPException(404, "사용자를 찾을 수 없습니다.")
         role = body.role or row["role"]
         active = row["is_active"] if body.is_active is None else int(body.is_active)
-        losing_admin = row["role"] == "admin" and row["is_active"] and (role != "admin" or not active)
-        if losing_admin:
-            others = conn.execute(
-                "SELECT COUNT(*) FROM users WHERE role = 'admin' AND is_active = 1 AND id != ?",
-                (user_id,)).fetchone()[0]
-            if others == 0:
-                raise HTTPException(400, "마지막 관리자는 강등하거나 비활성화할 수 없습니다.")
+        if row["is_owner"] and (role != "admin" or not active):
+            raise HTTPException(400, "최초 관리자는 강등하거나 비활성화할 수 없습니다.")
         conn.execute("UPDATE users SET role = ?, is_active = ? WHERE id = ?", (role, active, user_id))
         if body.password:
             conn.execute("UPDATE users SET password_hash = ? WHERE id = ?",

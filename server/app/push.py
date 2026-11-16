@@ -57,6 +57,35 @@ def send_to_user(user_id: int, payloads: list[dict]) -> dict:
     return result
 
 
+LIST_FIELDS = ("block_senders", "block_keywords", "important_senders", "important_keywords")
+DEFAULT_RULES = {"skip_bulk": True, "only_important": False, **{f: [] for f in LIST_FIELDS}}
+
+
+def load_rules(conn, user_id: int) -> dict:
+    row = conn.execute("SELECT * FROM notification_settings WHERE user_id = ?", (user_id,)).fetchone()
+    if row is None:
+        return dict(DEFAULT_RULES)
+    return {"skip_bulk": bool(row["skip_bulk"]), "only_important": bool(row["only_important"]),
+            **{f: json.loads(row[f]) for f in LIST_FIELDS}}
+
+
+def should_notify(mail: dict, rules: dict) -> bool:
+    """알림 규칙. 차단이 가장 우선이고, 그다음 '중요' 지정, 그다음 광고·대량메일 제외 순서로 본다."""
+    sender, subject = mail["sender"].lower(), mail["subject"].lower()
+
+    def hit(senders, keywords):
+        return (any(s.lower() in sender for s in rules[senders])
+                or any(k.lower() in subject for k in rules[keywords]))
+
+    if hit("block_senders", "block_keywords"):
+        return False
+    if hit("important_senders", "important_keywords"):
+        return True
+    if rules["only_important"]:
+        return False
+    return not (mail["is_bulk"] and rules["skip_bulk"])
+
+
 def notify_new_mails(user_id: int, mails: list[dict]) -> None:
     """새 메일 알림. 한꺼번에 많이 오면 한 건으로 묶는다."""
     if not mails:

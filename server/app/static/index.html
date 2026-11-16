@@ -151,6 +151,7 @@ async function run(btn, box, fn) {
 }
 
 const isAdmin = () => state.user && state.user.role === "admin";
+const isOwner = () => !!(state.user && state.user.is_owner);     // 사용자 관리는 최초 관리자만
 
 // ---------- 로그인 ----------
 function loginView() {
@@ -488,10 +489,10 @@ function usersView() {
         } }, "비밀번호 초기화");
         return h("tr", {},
           h("td", {}, u.username, u.id === state.user.id ? h("span", { class: "badge" }, "나") : null),
-          h("td", {}, u.role === "admin" ? "관리자" : "일반"),
+          h("td", {}, u.is_owner ? "최초 관리자" : (u.role === "admin" ? "관리자" : "일반")),
           h("td", {}, u.is_active ? "사용 중" : "비활성"),
           h("td", {}, fmtTime(u.created_at)),
-          h("td", {}, h("div", { class: "row" }, roleBtn, activeBtn, pwBtn)));
+          h("td", {}, h("div", { class: "row" }, u.is_owner ? null : roleBtn, u.is_owner ? null : activeBtn, pwBtn)));
       }))));
   }
   run(null, box, draw);
@@ -525,14 +526,14 @@ function render() {
   if (!state.user) { app.replaceChildren(loginView()); return; }
 
   const tabs = [["mails", "메일"], ["account", "메일 계정"], ["password", "비밀번호"]];
-  if (isAdmin()) tabs.push(["users", "사용자 관리"]);
+  if (isOwner()) tabs.push(["users", "사용자 관리"]);
   const views = { mails: mailsView, account: accountView, password: passwordView, users: usersView };
-  if (!views[state.tab] || (state.tab === "users" && !isAdmin())) state.tab = "mails";
+  if (!views[state.tab] || (state.tab === "users" && !isOwner())) state.tab = "mails";
 
   app.replaceChildren(
     h("header", {},
       h("h1", {}, "메일 비서"),
-      h("span", { class: "muted" }, state.user.username + " · " + (isAdmin() ? "관리자" : "일반")),
+      h("span", { class: "muted" }, state.user.username + " · " + (isOwner() ? "최초 관리자" : isAdmin() ? "관리자" : "일반")),
       h("button", { onclick: async () => {
         await dropPushSubscription();
         try { await api("POST", "auth/logout"); } catch (e) {}
