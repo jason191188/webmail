@@ -26,6 +26,17 @@ from app import analyzer, db, mailfetch, poller, push, security  # noqa: E402
 from app.main import app  # noqa: E402
 
 
+@pytest.fixture(autouse=True)
+def no_real_mail_server(monkeypatch):
+    """테스트가 실제 메일 서버에 접속하지 못하게 막는다. 필요한 테스트는 각자 가짜로 바꾼다."""
+    def blocked(*a, **k):
+        raise AssertionError("테스트에서 실제 메일 서버에 접속하려 했습니다")
+
+    monkeypatch.setattr(mailfetch, "connect", blocked)
+    monkeypatch.setattr(mailfetch, "open_smtp", blocked)
+    monkeypatch.setattr(mailfetch, "check_smtp_login", lambda *a: None)
+
+
 @pytest.fixture(scope="module")
 def client():
     with TestClient(app) as c:
@@ -94,8 +105,8 @@ def test_user_gets_alerts_only(client, staff):
     second = add_mail("staff1", "두 번째")
     rows = client.get("/mails", headers=staff, params={"after_id": first}).json()
     assert [r["id"] for r in rows] == [second]
-    assert set(rows[0]) == {"id", "sender", "subject", "mail_date", "fetched_at",
-                            "has_attachments", "analyzed"}
+    assert set(rows[0]) == {"id", "sender", "subject", "mail_date", "fetched_at", "has_attachments",
+                            "is_bulk", "notified", "analyzed", "replied"}          # 본문은 없다
 
 
 def test_mails_are_private_per_user(client, admin, staff):
@@ -266,6 +277,249 @@ def test_poller_saves_and_notifies(client, staff, monkeypatch):
                                      "tag": f"mail-{after[0]['id']}"}])]
     assert client.post("/mails/sync", headers=staff).json() == {"new_mails": 0}   # 같은 메일을 두 번 알리지 않는다
     assert len(notified) == 1
+
+
+def test_docs_closed_by_default(client):
+    for path in ("/docs", "/redoc", "/openapi.json"):
+        assert client.get(path).status_code == 404
+
+
+def test_parse_mail_bulk_and_reply_fields():
+    plain = mailfetch.parse_mail(
+        b"From: Kim <kim@example.com>\r\nReply-To: sales@example.com\r\nMessage-ID: <abc@example.com>\r\n"
+        b"Subject: hello\r\n\r\nbody")
+    assert (plain["reply_to"], plain["message_id"], plain["is_bulk"]) == ("sales@example.com", "<abc@example.com>", False)
+    assert mailfetch.parse_mail(b"From: a@b.co\r\nSubject: x\r\n\r\n.")["reply_to"] == "a@b.co"
+    assert mailfetch.parse_mail(b"From: a@b.co\r\nList-Unsubscribe: <mailto:u@b.co>\r\nSubject: x\r\n\r\n.")["is_bulk"]
+    assert mailfetch.parse_mail(b"From: a@b.co\r\nPrecedence: bulk\r\nSubject: x\r\n\r\n.")["is_bulk"]
+    ad = "From: a@b.co\r\nSubject: =?utf-8?b?KOq0keqzoCkg7ZWg7J24?=\r\n\r\n.".encode()      # "(광고) 할인"
+    assert mailfetch.parse_mail(ad)["is_bulk"]
+
+
+def test_notification_rules():
+    def mail(sender="Kim <kim@partner.com>", subject="견적 문의", bulk=False):
+        return {"sender": sender, "subject": subject, "is_bulk": bulk}
+
+    base = dict(push.DEFAULT_RULES)
+    assert push.should_notify(mail(), base)
+    assert not push.should_notify(mail(bulk=True), base)                                 # 광고는 기본으로 제외
+    assert push.should_notify(mail(bulk=True), {**base, "skip_bulk": False})
+    assert not push.should_notify(mail(), {**base, "block_senders": ["PARTNER.com"]})    # 대소문자 무시
+    assert not push.should_notify(mail(), {**base, "block_keywords": ["견적"]})
+    important = {**base, "important_senders": ["partner.com"]}
+    assert push.should_notify(mail(bulk=True), important)                                # 중요 지정이 광고 제외보다 우선
+    assert not push.should_notify(mail(), {**important, "block_keywords": ["견적"]})      # 차단이 가장 우선
+    only = {**base, "only_important": True, "important_keywords": ["긴급"]}
+    assert not push.should_notify(mail(), only)
+    assert push.should_notify(mail(subject="[긴급] 납품"), only)
+
+
+def test_notification_settings_api(client, staff):
+    assert client.get("/me/notification-settings", headers=staff).json() == push.DEFAULT_RULES
+    r = client.put("/me/notification-settings", headers=staff, json={
+        "skip_bulk": False, "block_senders": [" spam@x.com ", "", "spam@x.com"], "important_keywords": ["긴급"]})
+    assert r.status_code == 200
+    saved = client.get("/me/notification-settings", headers=staff).json()
+    assert saved["skip_bulk"] is False and saved["block_senders"] == ["spam@x.com"]
+    assert saved["important_keywords"] == ["긴급"]
+    too_long = client.put("/me/notification-settings", headers=staff, json={"block_keywords": ["x" * 101]})
+    assert too_long.status_code == 422
+    client.put("/me/notification-settings", headers=staff, json={})                      # 기본값으로 되돌림
+
+
+def test_poller_respects_notification_rules(client, admin, monkeypatch):
+    class FakePop:
+        def quit(self):
+            pass
+
+    monkeypatch.setattr(mailfetch, "connect", lambda *a: FakePop())
+    monkeypatch.setattr(mailfetch, "list_uids", lambda pop: {})
+    assert client.put("/me/mail-account", headers=admin,
+                      json={"mail_user": "boss@hprobot.ai", "mail_password": "pw"}).json()["smtp_error"] is None
+    raws = {
+        1: b"From: news@shop.com\r\nList-Unsubscribe: <mailto:u@shop.com>\r\nSubject: sale\r\n\r\n.",
+        2: b"From: kim@partner.com\r\nSubject: order\r\n\r\n.",
+        3: b"From: bad@spam.com\r\nSubject: hi\r\n\r\n.",
+    }
+    monkeypatch.setattr(mailfetch, "list_uids", lambda pop: {"n1": 1, "n2": 2, "n3": 3})
+    monkeypatch.setattr(mailfetch, "fetch_raw", lambda pop, num: raws[num])
+    client.put("/me/notification-settings", headers=admin, json={"block_senders": ["spam.com"]})
+    pushed = []
+    monkeypatch.setattr(push, "send_to_user", lambda user_id, payloads: pushed.extend(payloads))
+
+    assert client.post("/mails/sync", headers=admin).json() == {"new_mails": 3}
+    assert [p["title"] for p in pushed] == ["새 메일: order"]                              # 광고와 차단 발신자는 알리지 않는다
+    rows = {r["subject"]: r for r in client.get("/mails", headers=admin).json()}
+    assert (rows["sale"]["is_bulk"], rows["sale"]["notified"]) == (True, False)           # 목록에는 그대로 보인다
+    assert rows["order"]["notified"] is True and rows["hi"]["notified"] is False
+    client.put("/me/notification-settings", headers=admin, json={})
+
+
+def test_sync_login_delay_message(client, admin, monkeypatch):
+    import poplib
+
+    def delayed(*a):
+        raise poplib.error_proto(b"-ERR [LOGIN-DELAY] minimum time between mail checks violation")
+
+    monkeypatch.setattr(mailfetch, "connect", delayed)
+    assert client.post("/mails/sync", headers=admin).status_code == 429
+
+
+def test_build_reply_message():
+    msg = mailfetch.build_reply("me@hprobot.ai", ["kim@example.com", "lee@example.com"], "RE: 납품 일정",
+                                "안녕하세요.\n확인했습니다.", "<orig@example.com>")
+    assert msg["From"] == "me@hprobot.ai" and msg["To"] == "kim@example.com, lee@example.com"
+    assert msg["In-Reply-To"] == "<orig@example.com>" and msg["References"] == "<orig@example.com>"
+    assert msg["Message-ID"].endswith("@hprobot.ai>") and "Bcc" not in msg
+    assert "확인했습니다" in msg.get_content()
+    with pytest.raises(ValueError):
+        mailfetch.build_reply("me@hprobot.ai", ["kim@example.com"], "제목\r\nBcc: x@evil.com", "body")
+
+
+def test_reply_sending(client, admin, staff, monkeypatch):
+    sent = []
+    monkeypatch.setattr(mailfetch, "send_mail",
+                        lambda host, port, user, pw, msg, recipients: sent.append((host, port, user, pw, msg, recipients)))
+    mail_id = add_mail("boss")
+    payload = {"to": ["kim@example.com"], "subject": "RE: 납품 일정 문의", "body": "확인 후 회신드리겠습니다."}
+
+    assert client.post(f"/mails/{add_mail('staff1')}/reply", headers=staff, json=payload).status_code == 403
+    assert client.post(f"/mails/{mail_id}/reply", headers=admin,
+                       json={**payload, "to": ["not-an-address"]}).status_code == 422
+    assert client.post(f"/mails/{mail_id}/reply", headers=admin,
+                       json={**payload, "subject": "a\nBcc: x@evil.com"}).status_code == 422
+    assert sent == []
+
+    r = client.post(f"/mails/{mail_id}/reply", headers=admin, json=payload)
+    assert r.status_code == 201 and r.json()["recipients"] == ["kim@example.com"]
+    host, port, user, pw, msg, recipients = sent[0]
+    assert (host, port, user, pw) == ("smtp.cafe24.com", 587, "boss@hprobot.ai", "pw")
+    assert recipients == ["kim@example.com", "boss@hprobot.ai"]                           # 내 주소 숨은참조
+    assert msg["To"] == "kim@example.com" and msg["Subject"] == "RE: 납품 일정 문의"
+
+    client.post(f"/mails/{mail_id}/reply", headers=admin, json={**payload, "bcc_self": False})
+    assert sent[1][5] == ["kim@example.com"]
+    detail = client.get(f"/mails/{mail_id}", headers=admin).json()
+    assert len(detail["replies"]) == 2 and detail["replies"][0]["body"] == payload["body"]
+    listed = {m["id"]: m for m in client.get("/mails", headers=admin).json()}
+    assert listed[mail_id]["replied"] is True
+
+    def refuse(*a):
+        import smtplib
+        raise smtplib.SMTPRecipientsRefused({"kim@example.com": (550, b"no such user")})
+
+    monkeypatch.setattr(mailfetch, "send_mail", refuse)
+    assert client.post(f"/mails/{mail_id}/reply", headers=admin, json=payload).status_code == 400
+    assert len(client.get(f"/mails/{mail_id}", headers=admin).json()["replies"]) == 2     # 실패는 기록하지 않는다
+
+
+def test_partial_refusal_counts_as_failure(monkeypatch):
+    import smtplib
+
+    class FakeSmtp:
+        def send_message(self, msg, from_addr, to_addrs):
+            return {"kim@example.com": (550, b"no such user")}
+
+        def quit(self):
+            pass
+
+    monkeypatch.setattr(mailfetch, "open_smtp", lambda *a: FakeSmtp())
+    msg = mailfetch.build_reply("me@hprobot.ai", ["kim@example.com"], "s", "b")
+    with pytest.raises(smtplib.SMTPRecipientsRefused):
+        mailfetch.send_mail("h", 587, "me@hprobot.ai", "pw", msg, ["kim@example.com", "me@hprobot.ai"])
+
+
+def test_usage_log_report_and_budget(client, admin, staff, monkeypatch):
+    import dataclasses
+
+    from app import main, usage
+
+    assert usage.cost_usd("claude-opus-5-5", 1_000_000, 1_000_000) == 24.0
+    assert usage.cost_usd("claude-haiku-5-5", 2000, 1000) == pytest.approx(0.0007)
+    assert usage.cost_usd("some-future-model", 10, 10) is None
+
+    monkeypatch.setattr(analyzer, "analyze", lambda mail: {
+        "summary": "s", "actions": [], "reply_needed": False, "reply_draft": "",
+        "model": "claude-opus-5-5", "input_tokens": 2000, "output_tokens": 1000})
+    before = client.get("/admin/usage", headers=admin).json()
+    mail_id = add_mail("boss")
+    client.post(f"/mails/{mail_id}/analysis", headers=admin)
+    client.post(f"/mails/{mail_id}/analysis", headers=admin)                 # 저장된 결과: 사용량 없음
+    client.post(f"/mails/{mail_id}/analysis", headers=admin, params={"force": True})
+    after = client.get("/admin/usage", headers=admin).json()
+    assert after["spent_this_month_usd"] == pytest.approx(before["spent_this_month_usd"] + 2 * 0.028)
+    month = after["months"][0]
+    boss = next(u for u in month["users"] if u["username"] == "boss")
+    assert month["month"] == usage.month_key(db.now()) and boss["requests"] >= 2
+    assert client.get("/admin/usage", headers=staff).status_code == 403
+
+    limited = dataclasses.replace(usage.settings, monthly_budget_usd=0.01)
+    monkeypatch.setattr(usage, "settings", limited)
+    monkeypatch.setattr(main, "settings", limited)
+    assert client.post(f"/mails/{add_mail('boss')}/analysis", headers=admin).status_code == 429
+    assert client.post(f"/mails/{mail_id}/analysis", headers=admin).status_code == 200    # 저장된 결과는 한도와 무관
+
+
+def test_devices_list_and_remote_logout(client, admin):
+    phone = client.post("/auth/login", headers={"User-Agent": "TestPhone/1.0"},
+                        json={"username": "boss", "password": "boss-password-1"}).json()
+    phone_headers = {"Authorization": "Bearer " + phone["access_token"]}
+    sub = {"endpoint": "https://push.example.com/phone", "keys": {"p256dh": "p", "auth": "a"}}
+    assert client.post("/push/subscriptions", headers=phone_headers, json=sub).status_code == 204
+
+    devices = client.get("/me/devices", headers=admin).json()["devices"]
+    target = next(d for d in devices if d["user_agent"] == "TestPhone/1.0")
+    assert target["push_enabled"] is True and target["current"] is False
+    assert sum(d["current"] for d in devices) == 1
+
+    assert client.delete("/me/devices/nope", headers=admin).status_code == 404
+    assert client.delete(f"/me/devices/{target['id']}", headers=admin).status_code == 204
+    assert client.get("/me", headers=phone_headers).status_code == 401                    # 그 기기는 로그아웃됨
+    assert client.get("/me", headers=admin).status_code == 200
+    with db.connect() as conn:                                                            # 알림 등록도 함께 지워짐
+        assert conn.execute("SELECT 1 FROM push_subscriptions WHERE endpoint = ?", (sub["endpoint"],)).fetchone() is None
+
+
+def test_backup_and_retention(client, admin, staff, monkeypatch):
+    import dataclasses
+    import sqlite3
+    import time
+
+    from app import maintenance
+
+    assert client.get("/admin/backups", headers=staff).status_code == 403
+    assert client.post("/admin/backups", headers=staff).status_code == 403
+
+    tight = dataclasses.replace(maintenance.settings, backup_keep=2, mail_retention_days=30)
+    monkeypatch.setattr(maintenance, "settings", tight)
+    names = []
+    for _ in range(3):
+        names.append(maintenance.backup_now()["name"])
+        time.sleep(1.1)                                                                   # 파일 이름이 초 단위
+    kept = [b["name"] for b in maintenance.list_backups()]
+    assert kept == sorted(names, reverse=True)[:2]                                        # 최근 2개만 남긴다
+    copy = sqlite3.connect(tight.backup_dir / kept[0])
+    assert copy.execute("SELECT COUNT(*) FROM users").fetchone()[0] >= 2                  # 백업 파일이 실제로 읽힌다
+    copy.close()
+    listed = client.get("/admin/backups", headers=admin).json()
+    assert [b["name"] for b in listed["backups"]] == kept
+
+    old_id, new_id = add_mail("boss", "오래된 메일"), add_mail("boss", "최근 메일")
+    with db.connect() as conn:
+        conn.execute("UPDATE mails SET fetched_at = '2026-01-01T00:00:00+00:00' WHERE id = ?", (old_id,))
+        conn.execute("INSERT INTO sent_replies (mail_id, user_id, recipients, subject, body, sent_at)"
+                     " VALUES (?, 1, '[]', 's', 'b', 't')", (old_id,))
+    assert maintenance.purge_old() >= 1
+    ids = [m["id"] for m in client.get("/mails", headers=admin, params={"limit": 200}).json()]
+    assert new_id in ids and old_id not in ids
+    with db.connect() as conn:
+        assert conn.execute("SELECT 1 FROM sent_replies WHERE mail_id = ?", (old_id,)).fetchone() is None
+
+    forever = dataclasses.replace(tight, mail_retention_days=0)                           # 0 이면 지우지 않는다
+    monkeypatch.setattr(maintenance, "settings", forever)
+    with db.connect() as conn:
+        conn.execute("UPDATE mails SET fetched_at = '2026-01-01T00:00:00+00:00' WHERE id = ?", (new_id,))
+    assert maintenance.purge_old() == 0
 
 
 def test_user_management_is_owner_only(client, admin, monkeypatch):

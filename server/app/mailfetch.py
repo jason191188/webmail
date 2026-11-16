@@ -152,7 +152,9 @@ def send_mail(host: str, port: int, user: str, password: str, msg: EmailMessage,
     """recipients 는 실제로 받는 주소 전체(숨은참조 포함)."""
     smtp = open_smtp(host, port, user, password)
     try:
-        smtp.send_message(msg, from_addr=user, to_addrs=recipients)
+        refused = smtp.send_message(msg, from_addr=user, to_addrs=recipients)
+        if refused:      # 일부 주소만 거부돼도 실패로 본다 (숨은참조만 성공한 경우를 '보냄'으로 기록하지 않게)
+            raise smtplib.SMTPRecipientsRefused(refused)
     finally:
         try:
             smtp.quit()

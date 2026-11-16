@@ -61,6 +61,9 @@
   th, td { text-align: left; padding: 8px 6px; border-bottom: 1px solid var(--line); font-size: 14px; }
   .table-wrap { overflow-x: auto; }
   ul.actions { margin: 0; padding-left: 20px; }
+  label.check { display: flex; gap: 8px; align-items: flex-start; color: var(--text); font-size: 14px; }
+  label.check input { width: auto; margin-top: 4px; }
+  textarea.small { min-height: 90px; }
   .hidden { display: none; }
 </style>
 </head>
@@ -280,7 +283,10 @@ function mailsView() {
                     onclick: isAdmin() ? () => { state.selected = m.id; drawList(); drawDetail(); } : null },
             h("div", { class: "subject" }, m.subject,
               m.has_attachments ? h("span", { class: "badge" }, "첨부") : null,
-              m.analyzed ? h("span", { class: "badge" }, "분석됨") : null),
+              m.is_bulk ? h("span", { class: "badge" }, "광고") : null,
+              (!m.notified && !m.is_bulk) ? h("span", { class: "badge" }, "알림 제외") : null,
+              m.analyzed ? h("span", { class: "badge" }, "분석됨") : null,
+              m.replied ? h("span", { class: "badge" }, "답장함") : null),
             h("div", { class: "muted" }, m.sender),
             h("div", { class: "muted" }, "수신 확인 " + fmtTime(m.fetched_at)))))
       : h("p", { class: "muted" }, "아직 도착한 새 메일이 없습니다. 메일 계정을 등록한 뒤에 도착한 메일부터 표시됩니다."));
@@ -307,6 +313,23 @@ function mailsView() {
     }
     if (state.selected !== id) return;
 
+    // 답장 칸은 메일을 열 때 한 번 만들고, 초안이 오면 채운다
+    const rbox = msgBox();
+    const replyTo = h("input", { value: mail.reply_to || "", placeholder: "받는사람 주소 (여러 명은 쉼표로 구분)" });
+    const replySubject = h("input", { value: /^\s*re\s*:/i.test(mail.subject) ? mail.subject : "RE: " + mail.subject });
+    const replyBody = h("textarea", { placeholder: "답장 내용을 쓰거나, 위에서 초안을 요청하세요." });
+    const bccSelf = h("input", { type: "checkbox", checked: true, style: "width:auto" });
+    const historyHost = h("div", {});
+    let replies = mail.replies || [];
+
+    function drawHistory() {
+      historyHost.replaceChildren(replies.length
+        ? h("div", {}, h("h3", {}, "보낸 답장"),
+            h("ul", { class: "actions" }, replies.map(r =>
+              h("li", {}, fmtTime(r.sent_at) + " · " + r.recipients.join(", ") + " · " + r.subject))))
+        : null);
+    }
+
     function drawAnalysis() {
       if (!analysis) {
         const btn = h("button", { class: "primary", onclick: () => request(btn, false) }, "요약·답장 초안 요청");
@@ -314,11 +337,10 @@ function mailsView() {
           h("p", { class: "muted" }, "요청하면 Claude API를 호출하며 비용이 발생합니다."), btn);
         return;
       }
-      const draft = h("textarea", { value: analysis.reply_draft });
-      const copyBtn = h("button", { onclick: async () => {
-        try { await navigator.clipboard.writeText(draft.value); dbox.show("초안을 복사했습니다.", true); }
-        catch (e) { draft.select(); dbox.show("복사하지 못했습니다. 선택된 내용을 직접 복사하세요.", false); }
-      } }, "초안 복사");
+      if (analysis.reply_needed && !replyBody.value.trim()) replyBody.value = analysis.reply_draft;
+      const useBtn = analysis.reply_needed ? h("button", { onclick: () => {
+        if (!replyBody.value.trim() || confirm("답장 칸에 쓴 내용을 초안으로 바꿀까요?")) replyBody.value = analysis.reply_draft;
+      } }, "초안을 답장 칸에 다시 넣기") : null;
       const againBtn = h("button", { onclick: () => {
         if (confirm("다시 분석하면 Claude API 비용이 한 번 더 발생합니다. 진행할까요?")) request(againBtn, true);
       } }, "다시 분석");
@@ -327,9 +349,10 @@ function mailsView() {
         h("h3", {}, "필요한 조치"),
         analysis.actions.length ? h("ul", { class: "actions" }, analysis.actions.map(a => h("li", {}, a)))
                                 : h("p", { class: "muted" }, "없음"),
-        h("h3", {}, "답장 초안"),
-        analysis.reply_needed ? draft : h("p", { class: "muted" }, "답장이 필요 없는 메일로 판단했습니다."),
-        h("div", { class: "row", style: "margin-top:10px" }, analysis.reply_needed ? copyBtn : null, againBtn),
+        h("p", { class: "muted", style: "margin-top:12px" }, analysis.reply_needed
+          ? "답장 초안은 아래 답장 칸에 넣었습니다. 고친 뒤 보내세요."
+          : "답장이 필요 없는 메일로 판단했습니다."),
+        h("div", { class: "row" }, useBtn, againBtn),
         h("p", { class: "muted" }, analysis.model + " · 입력 " + analysis.input_tokens + " / 출력 "
           + analysis.output_tokens + " 토큰 · " + fmtTime(analysis.created_at)));
     }
@@ -347,6 +370,31 @@ function mailsView() {
       });
     }
 
+    const copyBtn = h("button", { onclick: async () => {
+      try { await navigator.clipboard.writeText(replyBody.value); rbox.show("답장 내용을 복사했습니다.", true); }
+      catch (e) { replyBody.select(); rbox.show("복사하지 못했습니다. 선택된 내용을 직접 복사하세요.", false); }
+    } }, "내용 복사");
+    const sendBtn = h("button", { class: "primary", onclick: () => {
+      const to = replyTo.value.split(/[,;\s]+/).filter(Boolean);
+      if (!to.length) { rbox.show("받는사람을 입력하세요.", false); return; }
+      if (!replySubject.value.trim() || !replyBody.value.trim()) { rbox.show("제목과 내용을 입력하세요.", false); return; }
+      if (!confirm(to.join(", ") + " 에게 답장을 보냅니다.\n보낸 메일은 취소할 수 없습니다. 보낼까요?")) return;
+      run(sendBtn, rbox, async () => {
+        sendBtn.textContent = "보내는 중...";
+        let sent;
+        try {
+          sent = await api("POST", "mails/" + id + "/reply",
+            { to, subject: replySubject.value, body: replyBody.value, bcc_self: bccSelf.checked });
+        } finally { sendBtn.textContent = "답장 보내기"; }
+        replies = [sent, ...replies];
+        drawHistory();
+        const row = state.mails.find(m => m.id === id);
+        if (row) row.replied = true;
+        drawList();
+        rbox.show("답장을 보냈습니다.", true);
+      });
+    } }, "답장 보내기");
+
     detailHost.replaceChildren(h("div", { class: "panel" },
       h("h2", {}, mail.subject),
       h("div", { class: "muted" }, "보낸사람: " + mail.sender),
@@ -355,8 +403,17 @@ function mailsView() {
       mail.attachments.length ? h("div", { class: "muted" }, "첨부: " + mail.attachments.join(", ")) : null,
       h("h3", {}, "본문"), h("pre", { class: "body" }, mail.body || "(본문 없음)"),
       mail.truncated ? h("p", { class: "muted" }, "본문이 길어 앞부분만 저장했습니다.") : null,
-      h("h3", {}, "요약·답장 초안"), dbox, analysisHost));
+      h("h3", {}, "요약·답장 초안"), dbox, analysisHost,
+      h("h3", {}, "답장 보내기"),
+      h("label", {}, "받는사람"), replyTo,
+      h("label", {}, "제목"), replySubject,
+      h("label", {}, "내용"), replyBody,
+      h("label", { class: "check" }, bccSelf, " 내 주소를 숨은참조로 넣기 (웹메일 보낸편지함에는 남지 않으므로, 받은편지함에 사본을 남깁니다)"),
+      rbox,
+      h("div", { class: "row", style: "margin-top:10px" }, sendBtn, copyBtn),
+      historyHost));
     drawAnalysis();
+    drawHistory();
   }
 
   async function refresh() {
@@ -393,11 +450,14 @@ function accountView() {
   const popHost = h("input", { value: "webmail.hprobot.ai", required: true });
   const popPort = h("input", { type: "number", value: "110", min: "1", max: "65535", required: true });
   const tlsName = h("input", { value: "pop3.cafe24.com" });
+  const smtpHost = h("input", { value: "smtp.cafe24.com", required: true });
+  const smtpPort = h("input", { type: "number", value: "587", min: "1", max: "65535", required: true });
 
   async function drawStatus() {
     try {
       const a = await api("GET", "me/mail-account");
       mailUser.value = a.mail_user; popHost.value = a.pop_host; popPort.value = a.pop_port; tlsName.value = a.tls_name;
+      smtpHost.value = a.smtp_host; smtpPort.value = a.smtp_port;
       const delBtn = h("button", { class: "danger", onclick: () => {
         if (!confirm("메일 계정 등록을 해제할까요? 새 메일 확인이 멈춥니다.")) return;
         run(delBtn, box, async () => { await api("DELETE", "me/mail-account"); box.show("등록을 해제했습니다.", true); drawStatus(); });
@@ -423,9 +483,12 @@ function accountView() {
       run(btn, box, async () => {
         const r = await api("PUT", "me/mail-account", {
           mail_user: mailUser.value.trim(), mail_password: mailPass.value,
-          pop_host: popHost.value.trim(), pop_port: Number(popPort.value), tls_name: tlsName.value.trim() });
+          pop_host: popHost.value.trim(), pop_port: Number(popPort.value), tls_name: tlsName.value.trim(),
+          smtp_host: smtpHost.value.trim(), smtp_port: Number(smtpPort.value) });
         mailPass.value = "";
-        box.show("저장했습니다. 기존 메일 " + r.skipped_existing_mails + "통은 건너뛰고, 이후 도착하는 메일부터 표시합니다.", true);
+        const saved = "저장했습니다. 기존 메일 " + r.skipped_existing_mails + "통은 건너뛰고, 이후 도착하는 메일부터 표시합니다.";
+        if (r.smtp_error) box.show(saved + " 다만 " + r.smtp_error + " 답장 발송은 되지 않습니다.", false);
+        else box.show(saved, true);
         drawStatus();
       });
     } },
@@ -436,9 +499,147 @@ function accountView() {
         h("summary", { class: "muted" }, "서버 설정 (보통 그대로 둡니다)"),
         h("label", {}, "POP3 서버"), popHost,
         h("label", {}, "POP3 포트"), popPort,
-        h("label", {}, "인증서 대조 이름"), tlsName),
+        h("label", {}, "인증서 대조 이름"), tlsName,
+        h("label", {}, "발송(SMTP) 서버"), smtpHost,
+        h("label", {}, "발송(SMTP) 포트"), smtpPort),
       box,
       h("div", { class: "row", style: "margin-top:14px" }, btn)));
+}
+
+// ---------- 알림 설정 ----------
+function notifyView() {
+  const box = msgBox();
+  const skipBulk = h("input", { type: "checkbox" });
+  const onlyImportant = h("input", { type: "checkbox" });
+  const areas = {};
+  const area = (key, placeholder) => (areas[key] = h("textarea", { class: "small", placeholder }));
+  const lines = (el) => el.value.split("\n").map(s => s.trim()).filter(Boolean);
+  const fill = (s) => {
+    skipBulk.checked = s.skip_bulk; onlyImportant.checked = s.only_important;
+    for (const key of Object.keys(areas)) areas[key].value = s[key].join("\n");
+  };
+  const btn = h("button", { class: "primary", type: "submit" }, "저장");
+  const form = h("form", { class: "panel", style: "max-width:640px", onsubmit: (ev) => {
+    ev.preventDefault();
+    run(btn, box, async () => {
+      const body = { skip_bulk: skipBulk.checked, only_important: onlyImportant.checked };
+      for (const key of Object.keys(areas)) body[key] = lines(areas[key]);
+      fill(await api("PUT", "me/notification-settings", body));
+      box.show("저장했습니다. 다음에 도착하는 메일부터 적용됩니다.", true);
+    });
+  } },
+    h("h2", {}, "알림 설정"),
+    h("p", { class: "muted" }, "휴대폰·브라우저 알림에만 적용됩니다. 알림을 받지 않는 메일도 메일 목록에는 그대로 보입니다."),
+    h("label", { class: "check" }, skipBulk, " 광고·대량 발송 메일은 알리지 않기 (수신거부 링크가 달린 메일, 제목이 '(광고)'로 시작하는 메일)"),
+    h("h3", {}, "알리지 않을 메일"),
+    h("label", {}, "발신자 (주소나 도메인의 일부, 한 줄에 하나)"), area("block_senders", "예: newsletter@shop.com\n예: @spam-domain.com"),
+    h("label", {}, "제목에 들어간 단어 (한 줄에 하나)"), area("block_keywords", "예: 세금계산서 발행 안내"),
+    h("h3", {}, "중요한 메일"),
+    h("p", { class: "muted" }, "여기에 해당하면 광고로 분류돼도 알립니다. 다만 '알리지 않을 메일'에도 해당하면 알리지 않습니다."),
+    h("label", {}, "발신자 (한 줄에 하나)"), area("important_senders", "예: @partner.co.kr"),
+    h("label", {}, "제목에 들어간 단어 (한 줄에 하나)"), area("important_keywords", "예: 긴급\n예: 발주"),
+    h("label", { class: "check", style: "margin-top:12px" }, onlyImportant, " 중요한 메일만 알리기 (나머지는 모두 알리지 않음)"),
+    box,
+    h("div", { class: "row", style: "margin-top:14px" }, btn));
+  run(null, box, async () => fill(await api("GET", "me/notification-settings")));
+  return form;
+}
+
+// ---------- 내 기기 ----------
+function deviceLabel(ua) {
+  if (!ua) return "알 수 없는 기기";
+  const os = /iPhone/.test(ua) ? "아이폰" : /iPad/.test(ua) ? "아이패드" : /Android/.test(ua) ? "안드로이드"
+    : /Windows/.test(ua) ? "Windows PC" : /Mac OS X|Macintosh/.test(ua) ? "Mac" : /Linux/.test(ua) ? "Linux" : "";
+  const browser = /Edg\//.test(ua) ? "Edge" : /SamsungBrowser/.test(ua) ? "삼성 인터넷" : /Whale/.test(ua) ? "웨일"
+    : /Firefox\//.test(ua) ? "Firefox" : /Chrome\//.test(ua) ? "Chrome" : /Safari\//.test(ua) ? "Safari" : "";
+  return [os, browser].filter(Boolean).join(" · ") || ua.slice(0, 40);
+}
+
+function devicesView() {
+  const box = msgBox();
+  const host = h("div", { class: "table-wrap" });
+
+  async function draw() {
+    const data = await api("GET", "me/devices");
+    const row = (d, pushOnly) => {
+      const btn = d.current ? null : h("button", { class: "danger", onclick: () => {
+        if (!confirm("이 기기를 끊을까요? 그 기기는 로그아웃되고 알림도 가지 않습니다.")) return;
+        run(btn, box, async () => {
+          await api("DELETE", (pushOnly ? "me/push-devices/" : "me/devices/") + d.id);
+          box.show("기기를 끊었습니다.", true);
+          await draw();
+        });
+      } }, "끊기");
+      return h("tr", {},
+        h("td", {}, deviceLabel(d.user_agent), d.current ? h("span", { class: "badge" }, "지금 이 기기") : null),
+        h("td", {}, pushOnly ? "알림만 등록됨" : (d.push_enabled ? "알림 켜짐" : "알림 꺼짐")),
+        h("td", {}, pushOnly ? "-" : fmtTime(d.created_at)),
+        h("td", {}, pushOnly ? "-" : (d.last_used_at ? fmtTime(d.last_used_at) : "-")),
+        h("td", {}, btn));
+    };
+    host.replaceChildren(h("table", {},
+      h("thead", {}, h("tr", {}, ["기기", "알림", "로그인한 날", "마지막 사용", ""].map(t => h("th", {}, t)))),
+      h("tbody", {}, data.devices.map(d => row(d, false)), data.push_only.map(d => row(d, true)))));
+  }
+  run(null, box, draw);
+  return h("div", { class: "panel" }, h("h2", {}, "내 기기"),
+    h("p", { class: "muted" }, "내 계정으로 로그인돼 있는 기기입니다. 잃어버렸거나 모르는 기기는 끊으세요."), box, host);
+}
+
+function meView() {
+  return h("div", {}, passwordView(), devicesView());
+}
+
+// ---------- 사용량, 백업 (최초 관리자) ----------
+function opsView() {
+  const box = msgBox();
+  const usageHost = h("div", {});
+  const backupHost = h("div", {});
+  const usd = (v) => "$" + Number(v).toFixed(v < 1 ? 4 : 2);
+  const size = (b) => b < 1048576 ? (b / 1024).toFixed(0) + " KB" : (b / 1048576).toFixed(1) + " MB";
+
+  async function drawUsage() {
+    const u = await api("GET", "admin/usage", undefined, { months: 6 });
+    const budget = u.monthly_budget_usd > 0
+      ? "이번 달 " + usd(u.spent_this_month_usd) + " / 한도 " + usd(u.monthly_budget_usd)
+      : "이번 달 " + usd(u.spent_this_month_usd) + " (월 한도 없음)";
+    usageHost.replaceChildren(
+      h("p", {}, h("strong", {}, budget)),
+      u.months.length ? h("div", { class: "table-wrap" }, h("table", {},
+        h("thead", {}, h("tr", {}, ["월", "사용자", "요청 수", "입력 토큰", "출력 토큰", "환산 비용"].map(t => h("th", {}, t)))),
+        h("tbody", {}, u.months.flatMap(m => [
+          ...m.users.map(x => h("tr", {}, h("td", {}, m.month), h("td", {}, x.username), h("td", {}, x.requests),
+            h("td", {}, x.input_tokens.toLocaleString()), h("td", {}, x.output_tokens.toLocaleString()),
+            h("td", {}, usd(x.cost_usd) + (x.unpriced_requests ? " + 가격 미상 " + x.unpriced_requests + "건" : "")))),
+          h("tr", {}, h("td", {}, h("strong", {}, m.month + " 합계")), h("td", {}, ""), h("td", {}, h("strong", {}, m.requests)),
+            h("td", {}, ""), h("td", {}, ""), h("td", {}, h("strong", {}, usd(m.cost_usd)))),
+        ]))))
+        : h("p", { class: "muted" }, "아직 요약·초안 요청 기록이 없습니다."),
+      h("p", { class: "muted" }, "비용은 토큰 수에 모델 가격표를 곱한 추정치입니다. 실제 청구액은 Claude 콘솔에서 확인하세요. 월 한도는 서버의 MONTHLY_BUDGET_USD 설정으로 정합니다."));
+  }
+
+  async function drawBackups() {
+    const b = await api("GET", "admin/backups");
+    backupHost.replaceChildren(
+      h("p", { class: "muted" }, "하루 한 번 자동으로 백업하고 최근 " + b.keep + "개를 보관합니다. "
+        + (b.mail_retention_days > 0 ? "받은 지 " + b.mail_retention_days + "일이 지난 메일은 자동으로 지웁니다."
+                                     : "메일은 자동으로 지우지 않습니다.")),
+      b.backups.length ? h("div", { class: "table-wrap" }, h("table", {},
+        h("thead", {}, h("tr", {}, ["백업 파일", "만든 시각", "크기"].map(t => h("th", {}, t)))),
+        h("tbody", {}, b.backups.map(x => h("tr", {}, h("td", {}, x.name), h("td", {}, fmtTime(x.created_at)), h("td", {}, size(x.size_bytes)))))))
+        : h("p", { class: "muted" }, "아직 백업이 없습니다."),
+      h("p", { class: "muted" }, "백업은 서버의 data/backups 폴더에 저장됩니다. 같은 디스크에 있으므로 주기적으로 다른 곳에 복사해 두세요."));
+  }
+
+  const backupBtn = h("button", { onclick: () => run(backupBtn, box, async () => {
+    const made = await api("POST", "admin/backups");
+    box.show("백업했습니다: " + made.name, true);
+    await drawBackups();
+  }) }, "지금 백업");
+  run(null, box, async () => { await drawUsage(); await drawBackups(); });
+  return h("div", {}, box,
+    h("div", { class: "panel" }, h("h2", {}, "Claude API 사용량"), usageHost),
+    h("div", { class: "panel" }, h("h2", {}, "백업과 보관"), h("div", { class: "row", style: "margin-bottom:10px" }, backupBtn), backupHost));
 }
 
 // ---------- 내 비밀번호 ----------
@@ -525,10 +726,10 @@ function render() {
   clearInterval(state.timer);
   if (!state.user) { app.replaceChildren(loginView()); return; }
 
-  const tabs = [["mails", "메일"], ["account", "메일 계정"], ["password", "비밀번호"]];
-  if (isOwner()) tabs.push(["users", "사용자 관리"]);
-  const views = { mails: mailsView, account: accountView, password: passwordView, users: usersView };
-  if (!views[state.tab] || (state.tab === "users" && !isOwner())) state.tab = "mails";
+  const tabs = [["mails", "메일"], ["notify", "알림 설정"], ["account", "메일 계정"], ["me", "내 계정"]];
+  if (isOwner()) tabs.push(["users", "사용자 관리"], ["ops", "사용량·백업"]);
+  const views = { mails: mailsView, notify: notifyView, account: accountView, me: meView, users: usersView, ops: opsView };
+  if (!views[state.tab] || ((state.tab === "users" || state.tab === "ops") && !isOwner())) state.tab = "mails";
 
   app.replaceChildren(
     h("header", {},

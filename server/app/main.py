@@ -1,32 +1,37 @@
 """메일 알림/분석 API 서버.
 
 권한:
-- 일반 사용자(user): 자기 메일 계정 등록, 새 메일 알림(보낸사람/제목/시간) 조회
-- 관리자(admin): 위 기능 + 자기 메일의 본문 조회, 요약/답장 초안 요청
-- 최초 관리자(is_owner): 위 기능 + 사용자 관리 (.env 로 만들어진 계정 하나뿐)
+- 일반 사용자(user): 자기 메일 계정 등록, 새 메일 알림(보낸사람/제목/시간) 조회, 알림 설정, 내 기기 관리
+- 관리자(admin): 위 기능 + 자기 메일의 본문 조회, 요약/답장 초안 요청, 답장 발송
+- 최초 관리자(is_owner): 위 기능 + 사용자 관리, 사용량, 백업 (.env 로 만들어진 계정 하나뿐)
 요약/답장 초안은 POST /mails/{id}/analysis 요청이 있을 때만 Claude API 를 호출한다.
+답장은 POST /mails/{id}/reply 요청이 있을 때만 발송한다. 자동 발송은 없다.
 """
+import hashlib
 import json
 import logging
 import poplib
+import re
+import smtplib
 import ssl
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 from typing import Literal
 
-from pathlib import Path
-
-from fastapi import Depends, FastAPI, HTTPException, Query
+from fastapi import Depends, FastAPI, HTTPException, Query, Request
 from fastapi.responses import FileResponse
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
-from . import analyzer, db, mailfetch, poller, push, security
+from . import analyzer, db, mailfetch, maintenance, poller, push, security, usage
 from .config import settings
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 log = logging.getLogger("app")
 STATIC_DIR = Path(__file__).parent / "static"
+EMAIL = re.compile(r"^[^@\s<>,;\"']+@[^@\s<>,;\"']+\.[^@\s<>,;\"']+$")
+LAST_USED_STEP = timedelta(minutes=5)      # 마지막 사용 시각은 이 간격으로만 갱신한다
 
 
 def bootstrap_admin() -> None:
@@ -48,32 +53,43 @@ async def lifespan(app: FastAPI):
     security.check_enc_key()
     db.init()
     bootstrap_admin()
-    worker = None
+    workers = []
     if settings.poll_enabled:
-        worker = poller.Poller()
-        worker.start()
+        workers = [poller.Poller(), maintenance.Maintenance()]
+        for w in workers:
+            w.start()
     yield
-    if worker:
-        worker.stop()
+    for w in workers:
+        w.stop()
 
 
-app = FastAPI(title="Webmail Assistant API", version="0.1.0", lifespan=lifespan)
+# API 문서는 DOCS_ENABLED=true 일 때만 연다
+_docs = dict(docs_url="/docs", redoc_url="/redoc", openapi_url="/openapi.json") if settings.docs_enabled \
+    else dict(docs_url=None, redoc_url=None, openapi_url=None)
+app = FastAPI(title="Webmail Assistant API", version="0.2.0", lifespan=lifespan, **_docs)
 bearer = HTTPBearer(auto_error=False)
 
 
 # ---------- 인증 ----------
 
-def current_user(cred: HTTPAuthorizationCredentials | None = Depends(bearer)):
+def current_user(cred: HTTPAuthorizationCredentials | None = Depends(bearer)) -> dict:
     if cred is None:
         raise HTTPException(401, "로그인이 필요합니다.")
+    token_hash = security.hash_token(cred.credentials)
+    now = db.now()
     with db.connect() as conn:
         row = conn.execute(
-            "SELECT u.* FROM sessions s JOIN users u ON u.id = s.user_id"
+            "SELECT u.*, s.last_used_at AS session_last_used FROM sessions s JOIN users u ON u.id = s.user_id"
             " WHERE s.token_hash = ? AND s.expires_at > ? AND u.is_active = 1",
-            (security.hash_token(cred.credentials), db.now())).fetchone()
-    if row is None:
-        raise HTTPException(401, "토큰이 유효하지 않거나 만료됐습니다.")
-    return row
+            (token_hash, now)).fetchone()
+        if row is None:
+            raise HTTPException(401, "토큰이 유효하지 않거나 만료됐습니다.")
+        last = row["session_last_used"]
+        if last is None or datetime.fromisoformat(now) - datetime.fromisoformat(last) > LAST_USED_STEP:
+            conn.execute("UPDATE sessions SET last_used_at = ? WHERE token_hash = ?", (now, token_hash))
+    user = dict(row)
+    user["session_hash"] = token_hash
+    return user
 
 
 def admin_user(user=Depends(current_user)):
@@ -83,7 +99,7 @@ def admin_user(user=Depends(current_user)):
 
 
 def owner_user(user=Depends(current_user)):
-    """사용자 관리는 최초 관리자(.env 로 만들어진 계정)만 할 수 있다."""
+    """사용자 관리, 사용량, 백업은 최초 관리자(.env 로 만들어진 계정)만 할 수 있다."""
     if not user["is_owner"]:
         raise HTTPException(403, "최초 관리자만 사용할 수 있습니다.")
     return user
@@ -131,7 +147,7 @@ for _name, _media_type in WEBAPP_FILES.items():
 
 
 @app.post("/auth/login")
-def login(body: LoginIn):
+def login(body: LoginIn, request: Request):
     key = body.username.strip().lower()
     if security.is_locked(key):
         raise HTTPException(429, "로그인 실패가 반복돼 잠시 잠겼습니다. 5분 뒤 다시 시도하세요.")
@@ -143,19 +159,22 @@ def login(body: LoginIn):
             raise HTTPException(401, "아이디 또는 비밀번호가 올바르지 않습니다.")
         security.clear_failures(key)
         token, token_hash = security.new_token()
+        now = db.now()
         expires = datetime.now(timezone.utc) + timedelta(days=settings.session_days)
         conn.execute(
-            "INSERT INTO sessions (token_hash, user_id, created_at, expires_at) VALUES (?, ?, ?, ?)",
-            (token_hash, row["id"], db.now(), expires.isoformat(timespec="seconds")))
-        conn.execute("DELETE FROM sessions WHERE expires_at <= ?", (db.now(),))
+            "INSERT INTO sessions (token_hash, user_id, created_at, expires_at, user_agent, last_used_at)"
+            " VALUES (?, ?, ?, ?, ?, ?)",
+            (token_hash, row["id"], now, expires.isoformat(timespec="seconds"),
+             request.headers.get("user-agent", "")[:300], now))
+        db.delete_sessions(conn, "expires_at <= ?", (now,))
     return {"access_token": token, "token_type": "bearer",
             "expires_at": expires.isoformat(timespec="seconds"), "user": user_out(row)}
 
 
 @app.post("/auth/logout", status_code=204)
-def logout(cred: HTTPAuthorizationCredentials = Depends(bearer), user=Depends(current_user)):
+def logout(user=Depends(current_user)):
     with db.connect() as conn:
-        conn.execute("DELETE FROM sessions WHERE token_hash = ?", (security.hash_token(cred.credentials),))
+        db.delete_sessions(conn, "token_hash = ?", (user["session_hash"],))
 
 
 @app.get("/me")
@@ -169,19 +188,69 @@ class PasswordChange(BaseModel):
 
 
 @app.put("/me/password", status_code=204)
-def change_password(body: PasswordChange, cred: HTTPAuthorizationCredentials = Depends(bearer),
-                    user=Depends(current_user)):
+def change_password(body: PasswordChange, user=Depends(current_user)):
     if not security.verify_password(user["password_hash"], body.current_password):
         raise HTTPException(400, "현재 비밀번호가 올바르지 않습니다.")
     with db.connect() as conn:
         conn.execute("UPDATE users SET password_hash = ? WHERE id = ?",
                      (security.hash_password(body.new_password), user["id"]))
-        # 지금 쓰는 세션만 남기고 나머지 기기는 로그아웃시킨다
-        conn.execute("DELETE FROM sessions WHERE user_id = ? AND token_hash != ?",
-                     (user["id"], security.hash_token(cred.credentials)))
+        # 지금 쓰는 기기만 남기고 나머지 기기는 로그아웃시킨다
+        db.delete_sessions(conn, "user_id = ? AND token_hash != ?", (user["id"], user["session_hash"]))
 
 
-# ---------- 관리자: 사용자 관리 ----------
+# ---------- 내 기기 ----------
+
+DEVICE_ID_LEN = 16
+
+
+def _push_id(endpoint: str) -> str:
+    return hashlib.sha256(endpoint.encode()).hexdigest()[:DEVICE_ID_LEN]
+
+
+@app.get("/me/devices")
+def list_devices(user=Depends(current_user)):
+    """내 계정으로 로그인돼 있는 기기 목록. 알림만 등록돼 있고 로그인 기록이 없는 기기는 push_only 로 준다."""
+    with db.connect() as conn:
+        sessions = conn.execute(
+            "SELECT s.*, EXISTS (SELECT 1 FROM push_subscriptions p WHERE p.session_hash = s.token_hash) AS push"
+            " FROM sessions s WHERE s.user_id = ? AND s.expires_at > ? ORDER BY s.last_used_at DESC",
+            (user["id"], db.now())).fetchall()
+        orphans = conn.execute(
+            "SELECT * FROM push_subscriptions WHERE user_id = ? AND (session_hash IS NULL"
+            " OR session_hash NOT IN (SELECT token_hash FROM sessions)) ORDER BY created_at DESC",
+            (user["id"],)).fetchall()
+    return {
+        "devices": [{"id": s["token_hash"][:DEVICE_ID_LEN], "user_agent": s["user_agent"],
+                     "created_at": s["created_at"], "last_used_at": s["last_used_at"],
+                     "push_enabled": bool(s["push"]), "current": s["token_hash"] == user["session_hash"]}
+                    for s in sessions],
+        "push_only": [{"id": _push_id(p["endpoint"]), "user_agent": p["user_agent"],
+                       "created_at": p["created_at"]} for p in orphans],
+    }
+
+
+@app.delete("/me/devices/{device_id}", status_code=204)
+def revoke_device(device_id: str, user=Depends(current_user)):
+    """그 기기를 로그아웃시키고 알림 등록도 지운다."""
+    with db.connect() as conn:
+        rows = conn.execute("SELECT token_hash FROM sessions WHERE user_id = ?", (user["id"],)).fetchall()
+        match = [r["token_hash"] for r in rows if r["token_hash"][:DEVICE_ID_LEN] == device_id]
+        if not match:
+            raise HTTPException(404, "기기를 찾을 수 없습니다.")
+        db.delete_sessions(conn, "token_hash = ?", (match[0],))
+
+
+@app.delete("/me/push-devices/{push_id}", status_code=204)
+def revoke_push_only(push_id: str, user=Depends(current_user)):
+    with db.connect() as conn:
+        rows = conn.execute("SELECT endpoint FROM push_subscriptions WHERE user_id = ?", (user["id"],)).fetchall()
+        match = [r["endpoint"] for r in rows if _push_id(r["endpoint"]) == push_id]
+        if not match:
+            raise HTTPException(404, "기기를 찾을 수 없습니다.")
+        conn.execute("DELETE FROM push_subscriptions WHERE endpoint = ?", (match[0],))
+
+
+# ---------- 최초 관리자: 사용자 관리 ----------
 
 class UserCreate(BaseModel):
     username: str = Field(min_length=3, max_length=50, pattern=r"^[A-Za-z0-9._@-]+$")
@@ -227,8 +296,30 @@ def patch_user(user_id: int, body: UserPatch, _=Depends(owner_user)):
             conn.execute("UPDATE users SET password_hash = ? WHERE id = ?",
                          (security.hash_password(body.password), user_id))
         if body.password or not active:
-            conn.execute("DELETE FROM sessions WHERE user_id = ?", (user_id,))
+            db.delete_sessions(conn, "user_id = ?", (user_id,))
+        if not active:
+            conn.execute("DELETE FROM push_subscriptions WHERE user_id = ?", (user_id,))
         return user_out(conn.execute("SELECT * FROM users WHERE id = ?", (user_id,)).fetchone())
+
+
+# ---------- 최초 관리자: 사용량, 백업 ----------
+
+@app.get("/admin/usage")
+def usage_report(months: int = Query(default=6, ge=1, le=24), _=Depends(owner_user)):
+    """월별·사용자별 Claude API 사용량과 환산 비용(가격표 기준 추정치)."""
+    with db.connect() as conn:
+        return usage.report(conn, months)
+
+
+@app.get("/admin/backups")
+def list_backups(_=Depends(owner_user)):
+    return {"backups": maintenance.list_backups(), "keep": settings.backup_keep,
+            "mail_retention_days": settings.mail_retention_days}
+
+
+@app.post("/admin/backups", status_code=201)
+def create_backup(_=Depends(owner_user)):
+    return maintenance.backup_now()
 
 
 # ---------- 메일 계정 ----------
@@ -240,12 +331,14 @@ class MailAccountIn(BaseModel):
     pop_port: int = Field(default=110, ge=1, le=65535)
     tls_name: str = Field(default="pop3.cafe24.com", max_length=200,
                           description="서버 인증서를 대조할 이름. 비우면 pop_host 를 쓴다.")
+    smtp_host: str = Field(default="smtp.cafe24.com", min_length=1, max_length=200)
+    smtp_port: int = Field(default=587, ge=1, le=65535)
 
 
 def account_out(row) -> dict:
     return {"mail_user": row["mail_user"], "pop_host": row["pop_host"], "pop_port": row["pop_port"],
-            "tls_name": row["tls_name"], "last_checked_at": row["last_checked_at"],
-            "last_error": row["last_error"]}
+            "tls_name": row["tls_name"], "smtp_host": row["smtp_host"], "smtp_port": row["smtp_port"],
+            "last_checked_at": row["last_checked_at"], "last_error": row["last_error"]}
 
 
 @app.get("/me/mail-account")
@@ -276,23 +369,68 @@ def put_mail_account(body: MailAccountIn, user=Depends(current_user)):
             pop.quit()
         except Exception:
             pass
+    # 발송 서버는 답장 기능에만 필요하므로, 실패해도 수신은 등록하고 결과만 알려 준다
+    smtp_error = None
+    try:
+        mailfetch.check_smtp_login(body.smtp_host, body.smtp_port, body.mail_user, body.mail_password)
+    except smtplib.SMTPAuthenticationError:
+        smtp_error = "발송 서버(SMTP) 로그인에 실패했습니다."
+    except (smtplib.SMTPException, ssl.SSLError, OSError) as e:
+        smtp_error = f"발송 서버(SMTP)에 접속하지 못했습니다: {type(e).__name__}"
     with db.connect() as conn:
         conn.execute("DELETE FROM mail_accounts WHERE user_id = ?", (user["id"],))
         cur = conn.execute(
             "INSERT INTO mail_accounts (user_id, pop_host, pop_port, tls_name, mail_user,"
-            " mail_password_enc, last_checked_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+            " mail_password_enc, last_checked_at, smtp_host, smtp_port) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (user["id"], body.pop_host, body.pop_port, body.tls_name, body.mail_user,
-             security.encrypt(body.mail_password), db.now()))
+             security.encrypt(body.mail_password), db.now(), body.smtp_host, body.smtp_port))
         conn.executemany("INSERT INTO pop_uids (account_id, uid) VALUES (?, ?)",
                          [(cur.lastrowid, uid) for uid in existing])
         row = conn.execute("SELECT * FROM mail_accounts WHERE id = ?", (cur.lastrowid,)).fetchone()
-    return {**account_out(row), "skipped_existing_mails": len(existing)}
+    return {**account_out(row), "skipped_existing_mails": len(existing), "smtp_error": smtp_error}
 
 
 @app.delete("/me/mail-account", status_code=204)
 def delete_mail_account(user=Depends(current_user)):
     with db.connect() as conn:
         conn.execute("DELETE FROM mail_accounts WHERE user_id = ?", (user["id"],))
+
+
+# ---------- 알림 설정 ----------
+
+class NotificationSettingsIn(BaseModel):
+    skip_bulk: bool = True
+    only_important: bool = False
+    block_senders: list[str] = Field(default_factory=list, max_length=50)
+    block_keywords: list[str] = Field(default_factory=list, max_length=50)
+    important_senders: list[str] = Field(default_factory=list, max_length=50)
+    important_keywords: list[str] = Field(default_factory=list, max_length=50)
+
+    @field_validator(*push.LIST_FIELDS)
+    @classmethod
+    def clean(cls, items: list[str]) -> list[str]:
+        cleaned = list(dict.fromkeys(i.strip() for i in items if i.strip()))
+        if any(len(i) > 100 for i in cleaned):
+            raise ValueError("항목은 100자 이하여야 합니다.")
+        return cleaned
+
+
+@app.get("/me/notification-settings")
+def get_notification_settings(user=Depends(current_user)):
+    with db.connect() as conn:
+        return push.load_rules(conn, user["id"])
+
+
+@app.put("/me/notification-settings")
+def put_notification_settings(body: NotificationSettingsIn, user=Depends(current_user)):
+    with db.connect() as conn:
+        conn.execute(
+            "INSERT OR REPLACE INTO notification_settings (user_id, skip_bulk, only_important,"
+            " block_senders, block_keywords, important_senders, important_keywords)"
+            " VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (user["id"], int(body.skip_bulk), int(body.only_important),
+             *(json.dumps(getattr(body, f), ensure_ascii=False) for f in push.LIST_FIELDS)))
+        return push.load_rules(conn, user["id"])
 
 
 # ---------- 푸시 알림 (휴대폰 / 브라우저) ----------
@@ -323,15 +461,17 @@ def push_public_key(_=Depends(current_user)):
 
 
 @app.post("/push/subscriptions", status_code=204)
-def push_subscribe(body: PushSubscriptionIn, user=Depends(current_user)):
+def push_subscribe(body: PushSubscriptionIn, request: Request, user=Depends(current_user)):
     """이 기기를 알림 대상으로 등록한다. 같은 기기를 다른 사용자가 쓰면 그 사용자 것으로 바뀐다."""
     require_push()
     with db.connect() as conn:
         conn.execute(
-            "INSERT INTO push_subscriptions (endpoint, user_id, p256dh, auth, created_at)"
-            " VALUES (?, ?, ?, ?, ?) ON CONFLICT(endpoint) DO UPDATE SET"
-            " user_id = excluded.user_id, p256dh = excluded.p256dh, auth = excluded.auth",
-            (body.endpoint, user["id"], body.keys.p256dh, body.keys.auth, db.now()))
+            "INSERT INTO push_subscriptions (endpoint, user_id, p256dh, auth, created_at, user_agent, session_hash)"
+            " VALUES (?, ?, ?, ?, ?, ?, ?) ON CONFLICT(endpoint) DO UPDATE SET"
+            " user_id = excluded.user_id, p256dh = excluded.p256dh, auth = excluded.auth,"
+            " user_agent = excluded.user_agent, session_hash = excluded.session_hash",
+            (body.endpoint, user["id"], body.keys.p256dh, body.keys.auth, db.now(),
+             request.headers.get("user-agent", "")[:300], user["session_hash"]))
 
 
 @app.post("/push/unsubscribe", status_code=204)
@@ -357,14 +497,17 @@ def push_test(user=Depends(current_user)):
 def mail_summary_out(row) -> dict:
     return {"id": row["id"], "sender": row["sender"], "subject": row["subject"],
             "mail_date": row["mail_date"], "fetched_at": row["fetched_at"],
-            "has_attachments": row["attachments"] != "[]", "analyzed": bool(row["analyzed"])}
+            "has_attachments": row["attachments"] != "[]", "is_bulk": bool(row["is_bulk"]),
+            "notified": bool(row["notified"]), "analyzed": bool(row["analyzed"]),
+            "replied": bool(row["replied"])}
 
 
 @app.get("/mails")
 def list_mails(after_id: int | None = Query(default=None, ge=0, description="이 id 보다 새 메일만 (앱의 알림 폴링용)"),
                limit: int = Query(default=50, ge=1, le=200), user=Depends(current_user)):
     """새 메일 알림 목록. after_id 를 주면 그 뒤에 도착한 메일을 오래된 순으로, 없으면 최신순으로 준다."""
-    base = ("SELECT m.*, EXISTS (SELECT 1 FROM analyses a WHERE a.mail_id = m.id) AS analyzed"
+    base = ("SELECT m.*, EXISTS (SELECT 1 FROM analyses a WHERE a.mail_id = m.id) AS analyzed,"
+            " EXISTS (SELECT 1 FROM sent_replies r WHERE r.mail_id = m.id) AS replied"
             " FROM mails m WHERE m.user_id = ?")
     with db.connect() as conn:
         if after_id is None:
@@ -384,6 +527,11 @@ def sync_now(user=Depends(current_user)):
         raise HTTPException(404, "등록된 메일 계정이 없습니다.")
     try:
         return {"new_mails": poller.sync_account(acc["id"])}
+    except poplib.error_proto as e:
+        text = str(e).upper()
+        if "LOGIN-DELAY" in text or "IN-USE" in text:
+            raise HTTPException(429, "메일 서버가 잠시 뒤에 다시 접속하라고 응답했습니다. 10초쯤 뒤에 다시 시도하세요.")
+        raise HTTPException(502, "메일 서버가 로그인을 거부했습니다. 메일 계정 화면에서 비밀번호를 확인하세요.")
     except Exception as e:
         raise HTTPException(502, f"메일 서버 확인에 실패했습니다: {type(e).__name__}")
 
@@ -400,11 +548,21 @@ def own_mail(mail_id: int, user) -> dict:
     return mail
 
 
+def reply_out(row) -> dict:
+    return {"id": row["id"], "recipients": json.loads(row["recipients"]), "subject": row["subject"],
+            "body": row["body"], "sent_at": row["sent_at"]}
+
+
 @app.get("/mails/{mail_id}")
 def get_mail(mail_id: int, user=Depends(admin_user)):
     mail = own_mail(mail_id, user)
-    return {k: mail[k] for k in ("id", "sender", "recipient", "subject", "mail_date",
-                                 "attachments", "body", "truncated", "fetched_at")}
+    with db.connect() as conn:
+        replies = conn.execute("SELECT * FROM sent_replies WHERE mail_id = ? ORDER BY id DESC",
+                               (mail_id,)).fetchall()
+    out = {k: mail[k] for k in ("id", "sender", "recipient", "subject", "mail_date", "attachments",
+                                "body", "truncated", "fetched_at", "reply_to")}
+    out["replies"] = [reply_out(r) for r in replies]
+    return out
 
 
 # ---------- 관리자: 요약 / 답장 초안 ----------
@@ -432,16 +590,20 @@ def request_analysis(mail_id: int,
                      user=Depends(admin_user)):
     """Claude API 로 요약과 답장 초안을 만든다. 이미 분석한 메일은 저장된 결과를 돌려준다(추가 과금 없음)."""
     mail = own_mail(mail_id, user)
-    if not force:
-        with db.connect() as conn:
+    with db.connect() as conn:
+        if not force:
             row = conn.execute("SELECT * FROM analyses WHERE mail_id = ?", (mail_id,)).fetchone()
-        if row is not None:
-            return analysis_out(row)
+            if row is not None:
+                return analysis_out(row)
+        if usage.budget_exceeded(conn):
+            raise HTTPException(429, f"이번 달 Claude API 한도(${settings.monthly_budget_usd:g})를 모두 썼습니다. "
+                                     "최초 관리자에게 문의하세요.")
     try:
         result = analyzer.analyze(mail)
     except analyzer.AnalyzerError as e:
         raise HTTPException(e.status, e.message)
     with db.connect() as conn:
+        usage.record(conn, user, mail_id, result)
         conn.execute(
             "INSERT OR REPLACE INTO analyses (mail_id, summary, actions, reply_needed, reply_draft,"
             " model, input_tokens, output_tokens, requested_by, created_at)"
@@ -451,3 +613,59 @@ def request_analysis(mail_id: int,
              result["input_tokens"], result["output_tokens"], user["id"], db.now()))
         row = conn.execute("SELECT * FROM analyses WHERE mail_id = ?", (mail_id,)).fetchone()
     return analysis_out(row)
+
+
+# ---------- 관리자: 답장 발송 ----------
+
+class ReplyIn(BaseModel):
+    to: list[str] = Field(min_length=1, max_length=10)
+    subject: str = Field(min_length=1, max_length=300)
+    body: str = Field(min_length=1, max_length=100_000)
+    bcc_self: bool = Field(default=True, description="내 주소를 숨은참조로 넣어 보낸 기록을 메일함에 남긴다")
+
+    @field_validator("to")
+    @classmethod
+    def valid_addresses(cls, items: list[str]) -> list[str]:
+        cleaned = list(dict.fromkeys(i.strip() for i in items))
+        bad = [i for i in cleaned if not EMAIL.match(i)]
+        if bad:
+            raise ValueError("메일 주소 형식이 올바르지 않습니다: " + ", ".join(bad)[:200])
+        return cleaned
+
+    @field_validator("subject")
+    @classmethod
+    def single_line(cls, value: str) -> str:
+        if "\r" in value or "\n" in value:
+            raise ValueError("제목에 줄바꿈을 넣을 수 없습니다.")
+        return value.strip()
+
+
+@app.post("/mails/{mail_id}/reply", status_code=201)
+def send_reply(mail_id: int, body: ReplyIn, user=Depends(admin_user)):
+    """이 메일에 대한 답장을 내 메일 계정으로 실제 발송한다. 호출할 때만 보내며 되돌릴 수 없다."""
+    mail = own_mail(mail_id, user)
+    with db.connect() as conn:
+        acc = conn.execute("SELECT * FROM mail_accounts WHERE user_id = ?", (user["id"],)).fetchone()
+    if acc is None:
+        raise HTTPException(400, "등록된 메일 계정이 없어 발송할 수 없습니다.")
+    try:
+        message = mailfetch.build_reply(acc["mail_user"], body.to, body.subject, body.body, mail["message_id"])
+    except ValueError:
+        raise HTTPException(422, "제목이나 받는사람에 사용할 수 없는 문자가 있습니다.")
+    recipients = body.to + ([acc["mail_user"]] if body.bcc_self and acc["mail_user"] not in body.to else [])
+    try:
+        mailfetch.send_mail(acc["smtp_host"], acc["smtp_port"], acc["mail_user"],
+                            security.decrypt(acc["mail_password_enc"]), message, recipients)
+    except smtplib.SMTPAuthenticationError:
+        raise HTTPException(502, "발송 서버 로그인에 실패했습니다. 메일 계정 화면에서 비밀번호를 다시 등록하세요.")
+    except smtplib.SMTPRecipientsRefused:
+        raise HTTPException(400, "발송 서버가 받는사람 주소를 거부했습니다. 주소를 확인하세요.")
+    except (smtplib.SMTPException, ssl.SSLError, OSError) as e:
+        log.warning("답장 발송 실패 (user %s): %s: %s", user["id"], type(e).__name__, e)
+        raise HTTPException(502, f"발송에 실패했습니다: {type(e).__name__}")
+    with db.connect() as conn:
+        cur = conn.execute(
+            "INSERT INTO sent_replies (mail_id, user_id, recipients, subject, body, sent_at)"
+            " VALUES (?, ?, ?, ?, ?, ?)",
+            (mail_id, user["id"], json.dumps(body.to), body.subject, body.body, db.now()))
+        return reply_out(conn.execute("SELECT * FROM sent_replies WHERE id = ?", (cur.lastrowid,)).fetchone())
